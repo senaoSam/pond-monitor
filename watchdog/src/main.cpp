@@ -1,0 +1,696 @@
+// ESP32-B : watchdog. Lives at home and watches every other node via RTDB.
+//
+// Why a separate location matters: A sits at the pond. If the watchdog shared
+// that site's power and network, a pond outage would take both down and no
+// alert would ever fire. Watching from home means a pond failure is visible.
+//
+// What it does, every CHECK_INTERVAL:
+//   1. GET /devices -- every node, not a hardcoded list, so adding node C
+//      later needs no firmware change here
+//   2. for each node other than itself, compare latest.ts against now;
+//      a node is stale once it has missed STALE_MULTIPLE of its own
+//      meta.interval (so the threshold follows A's cadence automatically)
+//   3. write /alerts/<id>/{active,firedAt,lastSeen,reason} on a state change
+//   4. publish its own /devices/watchdog/latest heartbeat, so a future node C
+//      can watch this one in turn
+//
+// Sending the Discord message is deliberately NOT done here: the requirement
+// is to keep re-notifying until acknowledged from a phone, and an ESP32 cannot
+// receive Discord interactions. A Node.js bot owns that loop and clears
+// /alerts/<id>/acked; this device only reports facts.
+
+#include <ArduinoOTA.h>
+#include <Arduino.h>
+#include <esp_ota_ops.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
+
+#include "secrets.h"
+
+// ---- configuration ----------------------------------------------------
+static const int LED_PIN = 48;  // onboard WS2812
+
+static const char *DEVICE_ID = "watchdog";
+static const char *DEVICE_NAME = "home-watchdog";
+static const char *FW_VERSION = "b1-2026.08.22";
+
+static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
+
+// A node counts as dead after missing this many of its own publish intervals.
+// A publishes every 60s, so 5 gives the agreed 5-minute threshold while
+// staying tolerant of one or two dropped uploads.
+static const uint32_t STALE_MULTIPLE = 5;
+
+// Used when a node's meta.interval is missing, so a malformed node still gets
+// a sane threshold rather than being treated as permanently fine.
+static const uint32_t DEFAULT_INTERVAL_S = 60;
+
+// ---- state ------------------------------------------------------------
+static WebServer server(80);
+static String logBuf;
+static const size_t LOG_MAX = 12000;
+
+static uint32_t checksRun = 0, alertsRaised = 0, alertsCleared = 0;
+static volatile bool otaInProgress = false;
+static String lastError = "none";
+static String lastSummary = "no check yet";
+static bool anyAlertActive = false;
+
+static void logLine(const char *fmt, ...) {
+  char line[220];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(line, sizeof(line), fmt, ap);
+  va_end(ap);
+
+  char stamp[24] = "";
+  time_t now = time(nullptr);
+  if (now > 1600000000) {
+    struct tm tm;
+    localtime_r(&now, &tm);
+    snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d ", tm.tm_hour, tm.tm_min,
+             tm.tm_sec);
+  }
+
+  logBuf += stamp;
+  logBuf += line;
+  logBuf += '\n';
+  if (logBuf.length() > LOG_MAX) {
+    int cut = logBuf.indexOf('\n', logBuf.length() - LOG_MAX);
+    logBuf.remove(0, cut < 0 ? logBuf.length() / 2 : cut + 1);
+  }
+}
+
+// ---- led --------------------------------------------------------------
+// Colour is the only diagnosis available with no console attached:
+//   green = all nodes healthy      red = a node is stale (alert active)
+//   blue  = connecting / OTA       yellow = RTDB unreachable
+//   purple = no WiFi (will reboot)
+enum StatusColor { OFF, GREEN, BLUE, RED, YELLOW, PURPLE };
+
+static void setLed(StatusColor c) {
+  uint8_t r = 0, g = 0, b = 0;
+  switch (c) {
+    case GREEN:  g = 40; break;
+    case BLUE:   b = 40; break;
+    case RED:    r = 40; break;
+    case YELLOW: r = 40; g = 25; break;
+    case PURPLE: r = 30; b = 30; break;
+    case OFF:    break;
+  }
+  // neopixelWrite, not rgbLedWrite: the latter is Arduino-ESP32 3.x only.
+  neopixelWrite(LED_PIN, r, g, b);
+}
+
+static void blinkColor(StatusColor c, int times, int onMs) {
+  for (int i = 0; i < times; i++) {
+    setLed(c);
+    delay(onMs);
+    setLed(OFF);
+    delay(onMs);
+  }
+}
+
+// ---- wifi -------------------------------------------------------------
+struct WiFiNetwork {
+  const char *ssid;
+  const char *pass;
+};
+static const WiFiNetwork NETWORKS[] = WIFI_NETWORKS;
+static const char *connectedSsid = "none";
+
+static bool connectWiFi() {
+  for (const WiFiNetwork &n : NETWORKS) {
+    WiFi.begin(n.ssid, n.pass);
+    uint32_t deadline = millis() + 12000;
+    while (WiFi.status() != WL_CONNECTED && millis() < deadline)
+      blinkColor(BLUE, 1, 250);
+
+    if (WiFi.status() == WL_CONNECTED) {
+      connectedSsid = n.ssid;
+      return true;
+    }
+    WiFi.disconnect();
+  }
+  return false;
+}
+
+// ---- rtdb -------------------------------------------------------------
+static bool rtdbRequest(const char *method, const String &path,
+                        const String &body, String *out) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(12000);
+
+  HTTPClient http;
+  String url = String("https://") + RTDB_HOST + path;
+  if (!http.begin(client, url)) {
+    lastError = "http.begin failed";
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(12000);
+
+  int code = body.length() ? http.sendRequest(method, body)
+                           : http.sendRequest(method);
+  bool ok = (code == 200);
+  if (ok && out) *out = http.getString();
+  if (!ok) lastError = String(method) + " " + path + " -> " + String(code);
+  http.end();
+  return ok;
+}
+
+// Minimal field extraction. A full JSON parse of /devices would need more
+// heap than the response is worth; these readings are flat numbers and short
+// strings at a known depth, so a scan is enough and cannot fragment the heap.
+static bool extractNumber(const String &json, int from, const char *key,
+                          double *out) {
+  String needle = String("\"") + key + "\":";
+  int k = json.indexOf(needle, from);
+  if (k < 0) return false;
+  int v = k + needle.length();
+  int end = v;
+  while (end < (int)json.length() &&
+         (isdigit(json[end]) || json[end] == '-' || json[end] == '.'))
+    end++;
+  if (end == v) return false;
+  *out = json.substring(v, end).toDouble();
+  return true;
+}
+
+// ---- discord ----------------------------------------------------------
+//
+// Notification and acknowledgement both run from this device: it posts an
+// alert message, then polls that message's reactions for a tick from the
+// owner. Polling is what makes a 24/7 server unnecessary -- Discord
+// interactions would have to be pushed to a listener, but reactions can be
+// pulled on our own schedule.
+//
+// Cadence: re-notify every RENOTIFY_S while an alert is active and unacked.
+// After acknowledgement, stay quiet for ACK_MUTE_S and then resume -- an
+// acknowledged-but-unfixed pond is exactly the case that must not go silent.
+
+static const uint32_t RENOTIFY_S = 5 * 60;
+static const uint32_t ACK_MUTE_S = 60 * 60;
+static const char *ACK_EMOJI = "%E2%9C%85";  // url-encoded white_check_mark
+
+// Learned from /users/@me at boot rather than configured, so distinguishing
+// the bot's own pre-seeded tick from a real acknowledgement needs no manual
+// id lookup.
+static String botUserId = "";
+
+static bool discordRequest(const char *method, const String &path,
+                           const String &body, String *out) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(12000);
+
+  HTTPClient http;
+  if (!http.begin(client, "https://discord.com/api/v10" + path)) {
+    lastError = "discord begin failed";
+    return false;
+  }
+  http.addHeader("Authorization", String("Bot ") + DISCORD_BOT_TOKEN);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("User-Agent", "pond-watchdog/1.0");
+  http.setTimeout(12000);
+
+  int code = body.length() ? http.sendRequest(method, body)
+                           : http.sendRequest(method);
+  bool ok = (code >= 200 && code < 300);
+  if (out) *out = http.getString();
+  if (!ok) lastError = "discord " + String(code) + " on " + path;
+  http.end();
+  return ok;
+}
+
+// Finds the message's own id in a Discord message object. Scans only at brace
+// depth 1, so ids belonging to nested objects (the author, the mentions array)
+// cannot be mistaken for the message id.
+static String extractTopLevelId(const String &json) {
+  int depth = 0;
+  bool inStr = false, esc = false;
+  for (int i = 0; i < (int)json.length(); i++) {
+    char c = json[i];
+    if (esc) { esc = false; continue; }
+    if (c == '\\') { esc = true; continue; }
+    if (c == '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+
+    if (c == '{' || c == '[') depth++;
+    else if (c == '}' || c == ']') depth--;
+    else if (depth == 1 && c == ':') {
+      // Is the key immediately before this colon exactly "id"?
+      int q2 = json.lastIndexOf('"', i);
+      if (q2 <= 0) continue;
+      int q1 = json.lastIndexOf('"', q2 - 1);
+      if (q1 < 0) continue;
+      if (json.substring(q1 + 1, q2) != "id") continue;
+
+      int v = json.indexOf('"', i);
+      if (v < 0) return "";
+      int e = json.indexOf('"', v + 1);
+      if (e < 0) return "";
+      return json.substring(v + 1, e);
+    }
+  }
+  return "";
+}
+
+// Posts the alert and returns the message id, which is what later reaction
+// polling needs. Also pre-seeds the tick so acknowledging is a single tap.
+static String discordNotify(const String &nodeId, const String &reason,
+                            uint32_t staleFor) {
+  String content = "<@" + String(DISCORD_USER_ID) + "> \\u26a0\\ufe0f **";
+  content += nodeId + " \\u5931\\u806f**\\n";  // "lost contact"
+  content += "reason: " + reason + "\\n";
+  content += "stale: " + String(staleFor / 60) + " min\\n";
+  content += "React \\u2705 to acknowledge (mutes " +
+             String(ACK_MUTE_S / 60) + " min).";
+
+  String body = "{\"content\":\"" + content + "\"}";
+  String resp;
+  if (!discordRequest("POST",
+                      "/channels/" + String(DISCORD_CHANNEL_ID) + "/messages",
+                      body, &resp)) {
+    logLine("discord notify FAILED: %s", lastError.c_str());
+    return "";
+  }
+
+  // The message id is the one at the top level of the response. A plain
+  // search for the first "id" would instead find the id nested inside the
+  // mentions array, so anchor on "channel_id" -- which only appears at the
+  // top level -- and take the last top-level "id" before it.
+  String msgId = extractTopLevelId(resp);
+
+  discordRequest("PUT",
+                 "/channels/" + String(DISCORD_CHANNEL_ID) + "/messages/" +
+                     msgId + "/reactions/" + ACK_EMOJI + "/@me",
+                 "", nullptr);
+  return msgId;
+}
+
+// True once someone other than the bot has ticked the message.
+static bool discordAcked(const String &msgId) {
+  if (!msgId.length()) return false;
+
+  String resp;
+  if (!discordRequest("GET",
+                      "/channels/" + String(DISCORD_CHANNEL_ID) +
+                          "/messages/" + msgId + "/reactions/" + ACK_EMOJI,
+                      "", &resp))
+    return false;
+
+  // The response lists users who reacted. Our own pre-seeded tick is always
+  // there, so an ack means some *other* user id appears.
+  int pos = 0;
+  while (true) {
+    int k = resp.indexOf("\"id\":\"", pos);
+    if (k < 0) return false;
+    int v = k + 6;
+    int e = resp.indexOf('"', v);
+    String uid = resp.substring(v, e);
+    pos = e;
+    if (uid != botUserId) return true;
+  }
+}
+
+// ---- alerts -----------------------------------------------------------
+
+// Only written on a transition. Rewriting an active alert every minute would
+// reset nothing but would churn the bot's listener and hide when it started.
+static bool writeAlert(const String &id, bool active, time_t lastSeen,
+                       const String &reason) {
+  time_t now = time(nullptr);
+  String body = "{";
+  body += "\"active\":" + String(active ? "true" : "false");
+  body += ",\"lastSeen\":" + String((uint32_t)lastSeen);
+  body += ",\"reason\":\"" + reason + "\"";
+  body += ",\"by\":\"" + String(DEVICE_ID) + "\"";
+  if (active) {
+    body += ",\"firedAt\":" + String((uint32_t)now);
+    // The bot owns `acked`; clearing it here is what starts a fresh
+    // notification loop for a newly-fired alert.
+    body += ",\"acked\":false";
+  } else {
+    body += ",\"clearedAt\":" + String((uint32_t)now);
+  }
+  body += "}";
+
+  return rtdbRequest("PATCH", "/alerts/" + id + ".json", body, nullptr);
+}
+
+// ---- notification state ----------------------------------------------
+//
+// Per-node so a second node (C) needs no extra code. Kept in RAM only: after
+// a reboot the first check re-notifies, which is the safe direction to err.
+struct NotifyState {
+  String nodeId;
+  String msgId;      // last alert message, polled for the ack reaction
+  time_t lastSent;   // when we last posted
+  time_t ackedAt;    // when the owner ticked it, 0 if never
+  bool inUse;
+
+  void reset() {
+    msgId = "";
+    lastSent = 0;
+    ackedAt = 0;
+  }
+};
+
+static const int MAX_NODES = 6;
+static NotifyState notifyStates[MAX_NODES];
+
+static NotifyState &notifyState(const String &id) {
+  for (int i = 0; i < MAX_NODES; i++)
+    if (notifyStates[i].inUse && notifyStates[i].nodeId == id)
+      return notifyStates[i];
+  for (int i = 0; i < MAX_NODES; i++)
+    if (!notifyStates[i].inUse) {
+      notifyStates[i].inUse = true;
+      notifyStates[i].nodeId = id;
+      notifyStates[i].reset();
+      return notifyStates[i];
+    }
+  return notifyStates[0];  // full: reuse the first rather than overflow
+}
+
+static uint32_t notifySent = 0, notifyAcked = 0;
+
+// Decides whether to post now. Called on every check while a node is stale.
+static void driveNotifications(const String &id, uint32_t staleFor) {
+  NotifyState &st = notifyState(id);
+  time_t now = time(nullptr);
+
+  // Poll for an acknowledgement on the message we last sent.
+  if (st.msgId.length() && !st.ackedAt && discordAcked(st.msgId)) {
+    st.ackedAt = now;
+    notifyAcked++;
+    logLine("%s acknowledged, muting %lu min", id.c_str(),
+            (unsigned long)(ACK_MUTE_S / 60));
+    // Mark the RTDB alert too, so a dashboard can show it was seen.
+    rtdbRequest("PATCH", "/alerts/" + id + ".json",
+                "{\"acked\":true,\"ackedAt\":" + String((uint32_t)now) + "}",
+                nullptr);
+  }
+
+  // An acknowledged alert stays quiet only for the mute window: a node that
+  // is still dead an hour later has to speak up again.
+  if (st.ackedAt) {
+    if ((uint32_t)(now - st.ackedAt) < ACK_MUTE_S) return;
+    logLine("%s mute expired, resuming alerts", id.c_str());
+    st.ackedAt = 0;
+    st.lastSent = 0;
+  }
+
+  if (st.lastSent && (uint32_t)(now - st.lastSent) < RENOTIFY_S) return;
+
+  String reason = "no publish for " + String(staleFor / 60) + " min";
+  String msgId = discordNotify(id, reason, staleFor);
+  if (msgId.length()) {
+    st.msgId = msgId;
+    st.lastSent = now;
+    notifySent++;
+    logLine("discord notified for %s (msg %s)", id.c_str(), msgId.c_str());
+  }
+}
+
+// ---- the check --------------------------------------------------------
+static void runCheck() {
+  checksRun++;
+
+  String json;
+  if (!rtdbRequest("GET", "/devices.json", "", &json)) {
+    logLine("RTDB unreachable: %s", lastError.c_str());
+    setLed(YELLOW);
+    return;
+  }
+
+  time_t now = time(nullptr);
+  int stale = 0, healthy = 0;
+  String summary;
+
+  // Walk the top-level device ids. Each looks like  "pond-site":{...}
+  int pos = 1;  // skip the opening brace
+  while (true) {
+    int q1 = json.indexOf('"', pos);
+    if (q1 < 0) break;
+    int q2 = json.indexOf('"', q1 + 1);
+    if (q2 < 0) break;
+    String id = json.substring(q1 + 1, q2);
+
+    // The device's own object ends where the next top-level id begins; using
+    // the whole remainder as the search window is fine because the fields we
+    // read appear before it.
+    int objStart = json.indexOf('{', q2);
+    if (objStart < 0) break;
+
+    // Find the matching close brace to bound this device's fields.
+    int depth = 0, objEnd = objStart;
+    for (int i = objStart; i < (int)json.length(); i++) {
+      if (json[i] == '{') depth++;
+      else if (json[i] == '}') { depth--; if (!depth) { objEnd = i; break; } }
+    }
+    String obj = json.substring(objStart, objEnd + 1);
+    pos = objEnd + 1;
+
+    if (id == DEVICE_ID) continue;  // don't watch ourselves
+
+    double ts = 0, interval = DEFAULT_INTERVAL_S;
+    if (!extractNumber(obj, 0, "ts", &ts)) {
+      logLine("%s: no latest.ts -- treating as stale", id.c_str());
+      ts = 0;
+    }
+    extractNumber(obj, 0, "interval", &interval);
+    if (interval < 10) interval = DEFAULT_INTERVAL_S;
+
+    uint32_t age = (now > (time_t)ts) ? (uint32_t)(now - (time_t)ts) : 0;
+    uint32_t limit = (uint32_t)interval * STALE_MULTIPLE;
+    bool isStale = age > limit;
+
+    summary += id + "=" + String(age) + "s" + (isStale ? "(STALE) " : "(ok) ");
+
+    // Compare against the stored alert so we only write on a transition.
+    String alertJson;
+    bool wasActive = false;
+    if (rtdbRequest("GET", "/alerts/" + id + "/active.json", "", &alertJson))
+      wasActive = (alertJson.indexOf("true") >= 0);
+
+    if (isStale && !wasActive) {
+      String reason = "no publish for " + String(age) + "s (limit " +
+                      String(limit) + "s)";
+      if (writeAlert(id, true, (time_t)ts, reason)) {
+        alertsRaised++;
+        logLine("ALERT RAISED %s: %s", id.c_str(), reason.c_str());
+      } else {
+        logLine("failed to raise alert for %s: %s", id.c_str(),
+                lastError.c_str());
+      }
+      notifyState(id).reset();
+    } else if (!isStale && wasActive) {
+      if (writeAlert(id, false, (time_t)ts, "publishing again")) {
+        alertsCleared++;
+        logLine("alert cleared %s (age %lus)", id.c_str(),
+                (unsigned long)age);
+      }
+      notifyState(id).reset();
+    }
+
+    if (isStale) driveNotifications(id, age);
+
+    if (isStale) stale++; else healthy++;
+  }
+
+  anyAlertActive = (stale > 0);
+  lastSummary = summary.length() ? summary : "no other devices found";
+  logLine("check: %d ok, %d stale | %s", healthy, stale, lastSummary.c_str());
+}
+
+// Its own heartbeat, so a future node C can watch this watchdog in turn.
+static bool publishSelf() {
+  time_t now = time(nullptr);
+  String body = "{";
+  body += "\"devices/" + String(DEVICE_ID) + "/latest\":{";
+  body += "\"ts\":" + String((uint32_t)now);
+  body += ",\"checks\":" + String(checksRun);
+  body += ",\"alerting\":" + String(anyAlertActive ? "true" : "false");
+  body += "}";
+  body += "}";
+  return rtdbRequest("PATCH", "/.json", body, nullptr);
+}
+
+static bool publishMeta() {
+  String body = "{";
+  body += "\"name\":\"" + String(DEVICE_NAME) + "\"";
+  body += ",\"scope\":\"watchdog\"";
+  body += ",\"role\":\"watchdog\"";
+  body += ",\"fw\":\"" + String(FW_VERSION) + "\"";
+  body += ",\"interval\":" + String(CHECK_INTERVAL_MS / 1000);
+  body += ",\"staleMultiple\":" + String(STALE_MULTIPLE);
+  body += ",\"bootAt\":" + String((uint32_t)time(nullptr));
+  body += "}";
+  return rtdbRequest("PUT", "/devices/" + String(DEVICE_ID) + "/meta.json",
+                     body, nullptr);
+}
+
+// ---- http status page -------------------------------------------------
+static void handleRoot() {
+  String b = "=== ESP32-B watchdog ===\n";
+  b += "ssid: " + String(connectedSsid) + "\n";
+  b += "ip: " + WiFi.localIP().toString() + "\n";
+  b += "rssi: " + String(WiFi.RSSI()) + " dBm\n";
+  b += "uptime: " + String(millis() / 1000) + "s\n";
+  b += "free heap: " + String(ESP.getFreeHeap()) + "\n\n";
+  b += "checks run: " + String(checksRun) + "\n";
+  b += "alerts raised: " + String(alertsRaised) + "\n";
+  b += "alerts cleared: " + String(alertsCleared) + "\n";
+  b += "alert active now: " + String(anyAlertActive ? "YES" : "no") + "\n";
+  b += "discord sent: " + String(notifySent) + "\n";
+  b += "discord acked: " + String(notifyAcked) + "\n";
+  b += "bot id: " + (botUserId.length() ? botUserId : String("UNKNOWN")) + "\n";
+  // Which OTA slot is live, and how much room the next update has. A failed
+  // "Could Not Activate" points here first.
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+  if (run) b += "running part: " + String(run->label) + " size=" + String(run->size) + "\n";
+  if (next) b += "next part: " + String(next->label) + " size=" + String(next->size) + "\n";
+  b += "sketch size: " + String(ESP.getSketchSize()) + "\n";
+  b += "free sketch space: " + String(ESP.getFreeSketchSpace()) + "\n";
+  b += "last check: " + lastSummary + "\n";
+  b += "last error: " + lastError + "\n";
+  b += "========================\n\n";
+  b += logBuf;
+  server.send(200, "text/plain; charset=utf-8", b);
+}
+
+static void handleCheckNow() {
+  runCheck();
+  server.send(200, "text/plain; charset=utf-8",
+              "check done: " + lastSummary + "\n");
+}
+
+// Posts a real Discord alert on demand, so the notification path can be
+// verified without waiting for an actual outage.
+static void handleTestAlert() {
+  String msgId = discordNotify("TEST", "manual test from /testalert", 0);
+  if (!msgId.length()) {
+    server.send(500, "text/plain", "discord post failed: " + lastError + "\n");
+    return;
+  }
+  server.send(200, "text/plain",
+              "posted msg " + msgId + "\nreact to it, then GET /testack?msg=" +
+                  msgId + "\n");
+}
+
+// Reports whether the test message has been acknowledged yet.
+static void handleTestAck() {
+  String msgId = server.arg("msg");
+  if (!msgId.length()) {
+    server.send(400, "text/plain", "usage: /testack?msg=<message_id>\n");
+    return;
+  }
+  bool acked = discordAcked(msgId);
+  server.send(200, "text/plain",
+              String("acked: ") + (acked ? "YES" : "no") + "\n");
+}
+
+void setup() {
+  blinkColor(BLUE, 2, 120);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  if (!connectWiFi()) {
+    setLed(PURPLE);
+    delay(5000);
+    ESP.restart();
+  }
+  blinkColor(GREEN, 5, 60);
+
+  // Staleness is judged against wall-clock time, so NTP must land first.
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  uint32_t ntpDeadline = millis() + 15000;
+  while (time(nullptr) < 1600000000 && millis() < ntpDeadline) delay(200);
+
+  logLine("boot ok ip=%s ssid=%s time=%s",
+          WiFi.localIP().toString().c_str(), connectedSsid,
+          time(nullptr) > 1600000000 ? "synced" : "NOT SYNCED");
+  logLine("meta publish: %s", publishMeta() ? "ok" : "FAILED");
+
+  // Identify ourselves so the ack check can ignore the bot's own reaction.
+  String me;
+  if (discordRequest("GET", "/users/@me", "", &me)) {
+    int k = me.indexOf("\"id\":\"");
+    if (k >= 0) botUserId = me.substring(k + 6, me.indexOf('"', k + 6));
+    logLine("discord ok, bot id=%s", botUserId.c_str());
+  } else {
+    logLine("discord /users/@me FAILED: %s", lastError.c_str());
+  }
+
+  ArduinoOTA.setHostname(DEVICE_ID);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    // A check does several blocking TLS round-trips; if one starts mid-upload
+    // the OTA socket stalls long enough for the host to give up. Suspend
+    // checking until the reboot that ends the update.
+    otaInProgress = true;
+    setLed(BLUE);
+  });
+  ArduinoOTA.onEnd([]() { setLed(GREEN); });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    setLed((done / 16384) % 2 ? BLUE : OFF);
+  });
+  ArduinoOTA.onError([](ota_error_t) {
+    otaInProgress = false;  // resume checking; the old firmware is still live
+    setLed(RED);
+  });
+  ArduinoOTA.begin();
+
+  server.on("/", handleRoot);
+  server.on("/check", handleCheckNow);
+  server.on("/testalert", handleTestAlert);
+  server.on("/testack", handleTestAck);
+  server.begin();
+}
+
+void loop() {
+  static uint32_t nextCheck = 0;
+
+  ArduinoOTA.handle();
+
+  // While an upload is running, do nothing else: no HTTP serving, no checks.
+  // An interrupted OTA leaves the old firmware intact, so pausing monitoring
+  // for the ~30s of an update is the cheaper risk.
+  if (otaInProgress) {
+    delay(1);
+    return;
+  }
+
+  server.handleClient();
+
+  if ((int32_t)(millis() - nextCheck) < 0) {
+    // Pulse while idle so health is readable at a glance: red means a node is
+    // currently stale, which is the whole point of this device.
+    static uint32_t nextPulse = 0;
+    if ((int32_t)(millis() - nextPulse) >= 0) {
+      nextPulse = millis() + 2000;
+      setLed(anyAlertActive ? RED : GREEN);
+      delay(30);
+      setLed(OFF);
+    }
+    delay(10);
+    return;
+  }
+  nextCheck = millis() + CHECK_INTERVAL_MS;
+
+  // Give OTA a window before the blocking TLS work starts.
+  for (int i = 0; i < 20; i++) {
+    ArduinoOTA.handle();
+    delay(5);
+  }
+
+  runCheck();
+  publishSelf();
+}
