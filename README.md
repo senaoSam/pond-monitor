@@ -47,6 +47,30 @@ alerts/pond-site/
 `meta.interval` 是 watchdog 的門檻來源 —— 改變感測器上傳頻率，
 watchdog 自動跟隨，不需重燒。
 
+## 新板子驗收
+
+**不要相信板子上的絲印，也不要按型號推定設定。** 兩片板子都印
+ESP32-S3-N16R8，eFuse 也確認確實有 8MB PSRAM，但 watchdog 那片的 PSRAM
+在 Arduino 2.0.17 下就是初始化不了（`opi` / `qio` 兩種模式皆然），
+而錯誤的宣告只會表現成「OTA 壞掉」，其他一切正常。
+
+驗收步驟：
+
+```bash
+# 1. 硬體事實(eFuse,出廠燒死,最權威)
+esptool  --chip esp32s3 --port COMx flash_id     # 看 Features 那行
+espefuse --chip esp32s3 --port COMx summary      # PSRAM_CAP / PSRAM_VENDOR / FLASH_TYPE
+
+# 2. Arduino 層是否真的用得到(燒 board-check,看 LED)
+cd board-check && pio run -t upload --upload-port COMx
+#   綠 = PSRAM 可用    黃 = 讀不到 PSRAM,勿宣告    紅 = 數值異常
+```
+
+兩者都要看：eFuse 說「硬體有」，board-check 說「軟體用得到嗎」——
+**只有後者為真才可以宣告 `BOARD_HAS_PSRAM`。**
+
+這個專案的韌體約用 60KB，內建 320KB heap 已足夠，不需要 PSRAM。
+
 ## 硬體參數
 
 **QX-DT01P RS485 水溫探頭**（無手冊，參數由暴力掃描取得）
@@ -90,8 +114,21 @@ pio run -e esp32-s3-devkitc-1 -t upload --upload-port COMx
 ### OTA 疑難排解
 
 **`Could Not Activate The Firmware`**（傳輸 100% 完成但拒絕啟用）
-→ 分區狀態不正確，**用 USB 重燒一次即可修好**（會重寫 bootloader 與分區表）。
-重試或改設定無效。狀態頁的 `running part` / `free sketch space` 可先確認。
+→ **檢查狀態頁的 `psram:` 是否為 0。** 若是 0 卻宣告了 `-DBOARD_HAS_PSRAM`，
+就是這個原因：PSRAM 初始化失敗的情況下宣告它會破壞 OTA，
+而 **USB 燒錄和程式運行都完全正常**，所以極難歸因。移除
+`board_build.psram_type` 和 `-DBOARD_HAS_PSRAM` 即可。
+
+實測記錄（watchdog 那片）：
+
+| 設定 | `getPsramSize()` | OTA |
+|---|---|---|
+| `psram_type=opi` + `BOARD_HAS_PSRAM` | 0 | ❌ |
+| `psram_type=qio` + `BOARD_HAS_PSRAM` | 0 | ❌ |
+| 兩者都不宣告 | — | ✅ 雙向皆可 |
+
+已排除、不必再試：分區表設定、`maximum_size` 覆寫、完整 `erase_flash`
+重燒、映像格式、寫入方向、檢查迴圈阻塞。
 
 **`Error Uploading`**（傳輸中途失敗）
 → 裝置忙於阻塞式 TLS 請求。兩份韌體都已加入 `otaInProgress` 暫停機制，

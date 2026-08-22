@@ -260,16 +260,44 @@ static String extractTopLevelId(const String &json) {
   return "";
 }
 
+// Formats a unix time as local HH:MM. Alerts are read on a phone, where an
+// absolute clock time is easier to act on than an elapsed-seconds count.
+static String localHhMm(time_t t) {
+  if (t < 1600000000) return "\\u4e0d\\u660e";  // unknown
+  struct tm tm;
+  localtime_r(&t, &tm);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+  return String(buf);
+}
+
 // Posts the alert and returns the message id, which is what later reaction
 // polling needs. Also pre-seeds the tick so acknowledging is a single tap.
+//
+// Text is escaped as \uXXXX rather than literal UTF-8: the body is hand-built
+// JSON, and raw multibyte characters there are easy to corrupt.
 static String discordNotify(const String &nodeId, const String &reason,
-                            uint32_t staleFor) {
+                            uint32_t staleFor, time_t lastSeen,
+                            const String &lastReading, int notifyCount) {
+  // Renders as:
+  //   @owner ⚠️ **pond-site 失聯**（第 2 次提醒）
+  //   最後回報：01:45
+  //   已中斷：6 分鐘
+  //   最後讀值：26.3 °C
+  //   原因：超過 6 分鐘未回報
+  //   點 ✅ 回報已知悉（靜音 60 分鐘）
   String content = "<@" + String(DISCORD_USER_ID) + "> \\u26a0\\ufe0f **";
-  content += nodeId + " \\u5931\\u806f**\\n";  // "lost contact"
-  content += "reason: " + reason + "\\n";
-  content += "stale: " + String(staleFor / 60) + " min\\n";
-  content += "React \\u2705 to acknowledge (mutes " +
-             String(ACK_MUTE_S / 60) + " min).";
+  content += nodeId + " \\u5931\\u806f**";
+  if (notifyCount > 1)
+    content += "\\uff08\\u7b2c " + String(notifyCount) + " \\u6b21\\u63d0\\u9192\\uff09";
+  content += "\\n";
+  content += "\\u6700\\u5f8c\\u56de\\u5831\\uff1a" + localHhMm(lastSeen) + "\\n";
+  content += "\\u5df2\\u4e2d\\u65ad\\uff1a" + String(staleFor / 60) + " \\u5206\\u9418\\n";
+  if (lastReading.length())
+    content += "\\u6700\\u5f8c\\u8b80\\u503c\\uff1a" + lastReading + "\\n";
+  content += "\\u539f\\u56e0\\uff1a" + reason + "\\n";
+  content += "\\u9ede \\u2705 \\u56de\\u5831\\u5df2\\u77e5\\u6089\\uff08\\u9759\\u97f3 " +
+             String(ACK_MUTE_S / 60) + " \\u5206\\u9418\\uff09";
 
   String body = "{\"content\":\"" + content + "\"}";
   String resp;
@@ -352,12 +380,14 @@ struct NotifyState {
   String msgId;      // last alert message, polled for the ack reaction
   time_t lastSent;   // when we last posted
   time_t ackedAt;    // when the owner ticked it, 0 if never
+  int sentCount;     // shown in the message so repeats are distinguishable
   bool inUse;
 
   void reset() {
     msgId = "";
     lastSent = 0;
     ackedAt = 0;
+    sentCount = 0;
   }
 };
 
@@ -381,7 +411,10 @@ static NotifyState &notifyState(const String &id) {
 static uint32_t notifySent = 0, notifyAcked = 0;
 
 // Decides whether to post now. Called on every check while a node is stale.
-static void driveNotifications(const String &id, uint32_t staleFor) {
+// `lastSeen` and `lastReading` come from the node's own latest/ record, so the
+// alert says when contact was lost and what the last value was.
+static void driveNotifications(const String &id, uint32_t staleFor,
+                               time_t lastSeen, const String &lastReading) {
   NotifyState &st = notifyState(id);
   time_t now = time(nullptr);
 
@@ -408,13 +441,19 @@ static void driveNotifications(const String &id, uint32_t staleFor) {
 
   if (st.lastSent && (uint32_t)(now - st.lastSent) < RENOTIFY_S) return;
 
-  String reason = "no publish for " + String(staleFor / 60) + " min";
-  String msgId = discordNotify(id, reason, staleFor);
+  // "超過 %d 分鐘未回報" -- exceeded N minutes without reporting
+  String reason = "\\u8d85\\u904e " + String(staleFor / 60) +
+                  " \\u5206\\u9418\\u672a\\u56de\\u5831";
+  String msgId =
+      discordNotify(id, reason, staleFor, lastSeen, lastReading,
+                    st.sentCount + 1);
   if (msgId.length()) {
     st.msgId = msgId;
     st.lastSent = now;
+    st.sentCount++;
     notifySent++;
-    logLine("discord notified for %s (msg %s)", id.c_str(), msgId.c_str());
+    logLine("discord notified for %s (msg %s, #%d)", id.c_str(),
+            msgId.c_str(), st.sentCount);
   }
 }
 
@@ -499,7 +538,15 @@ static void runCheck() {
       notifyState(id).reset();
     }
 
-    if (isStale) driveNotifications(id, age);
+    if (isStale) {
+      // Surface whatever the node last measured. Read from meta.sensors so a
+      // node with different sensors needs no change here.
+      String reading;
+      double temp;
+      if (extractNumber(obj, 0, "temp", &temp))
+        reading = String(temp, 1) + " \\u00b0C";
+      driveNotifications(id, age, (time_t)ts, reading);
+    }
 
     if (isStale) stale++; else healthy++;
   }
@@ -559,6 +606,11 @@ static void handleRoot() {
   if (next) b += "next part: " + String(next->label) + " size=" + String(next->size) + "\n";
   b += "sketch size: " + String(ESP.getSketchSize()) + "\n";
   b += "free sketch space: " + String(ESP.getFreeSketchSpace()) + "\n";
+  // PSRAM presence: a psram_type mismatch is invisible to USB flashing but
+  // can break the buffer allocation an OTA write needs.
+  b += "psram: " + String(ESP.getPsramSize()) + " (free " +
+       String(ESP.getFreePsram()) + ")\n";
+  b += "flash: " + String(ESP.getFlashChipSize()) + "\n";
   b += "last check: " + lastSummary + "\n";
   b += "last error: " + lastError + "\n";
   b += "========================\n\n";
@@ -575,7 +627,9 @@ static void handleCheckNow() {
 // Posts a real Discord alert on demand, so the notification path can be
 // verified without waiting for an actual outage.
 static void handleTestAlert() {
-  String msgId = discordNotify("TEST", "manual test from /testalert", 0);
+  // "手動測試" -- manual test
+  String msgId = discordNotify("TEST", "\\u624b\\u52d5\\u6e2c\\u8a66", 0,
+                               time(nullptr), "28.0 \\u00b0C", 1);
   if (!msgId.length()) {
     server.send(500, "text/plain", "discord post failed: " + lastError + "\n");
     return;
