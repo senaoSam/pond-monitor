@@ -17,7 +17,14 @@
 //
 //   RTDB  /firmware/<device>/version   : integer, bump to trigger an update
 //         /firmware/<device>/url       : https URL of the .bin
+//         /fwlog/<device>/<ts>         : one record per update attempt
 //   NVS   fw.running / fw.pending / fw.bad
+//
+// The log exists because /firmware and meta.fw only ever hold the current
+// value. Without it a rollback leaves no trace at all -- and a rollback is
+// precisely the event worth knowing about, since it means some version is
+// broken. It also lets "it started misbehaving on Tuesday" be checked against
+// what was actually shipped.
 //
 // Usage from the sketch:
 //   otaPullBegin(DEVICE_ID, FW_VERSION_CODE);   // in setup(), after WiFi
@@ -31,6 +38,8 @@
 #include <Preferences.h>
 #include <Update.h>
 #include <WiFiClientSecure.h>
+#include <esp_err.h>
+#include <esp_partition.h>
 #include <esp_ota_ops.h>
 
 // ---- state ------------------------------------------------------------
@@ -38,6 +47,10 @@ static Preferences otaPrefs;
 static const char *otaDeviceId = "";
 static uint32_t otaRunningVersion = 0;
 static bool otaMarkedGood = false;
+// Set at boot when a rollback is detected, logged once the clock is up.
+static uint32_t rolledBackFrom = 0;
+// Remembered so the deferred log write does not need it passed in again.
+static const char *otaRtdbHost = nullptr;
 static String otaLastStatus = "idle";
 static uint32_t otaAttempts = 0, otaFailures = 0;
 
@@ -46,6 +59,44 @@ static String otaPullStatus() { return otaLastStatus; }
 static uint32_t otaPullAttempts() { return otaAttempts; }
 static uint32_t otaPullFailures() { return otaFailures; }
 static uint32_t otaPullVersion() { return otaRunningVersion; }
+
+// ---- log --------------------------------------------------------------
+
+// Appends one record under /fwlog/<device>/<unix ts>. Best-effort: a failure
+// to log must never interfere with the update itself, so the result is ignored
+// by callers.
+static void otaLogEvent(const char *rtdbHost, uint32_t fromVer,
+                        uint32_t toVer, const char *result,
+                        const String &detail) {
+  time_t now = time(nullptr);
+  if (now < 1600000000) return;  // no clock yet; a key would be meaningless
+
+  String body = "{";
+  body += "\"from\":" + String(fromVer);
+  body += ",\"to\":" + String(toVer);
+  body += ",\"result\":\"" + String(result) + "\"";
+  if (detail.length()) {
+    // Quotes and backslashes would break the hand-built JSON.
+    String d = detail;
+    d.replace("\\", " ");
+    d.replace("\"", "'");
+    body += ",\"detail\":\"" + d + "\"";
+  }
+  body += "}";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(10000);
+
+  HTTPClient http;
+  String u = String("https://") + rtdbHost + "/fwlog/" + otaDeviceId + "/" +
+             String((uint32_t)now) + ".json";
+  if (!http.begin(client, u)) return;
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+  http.sendRequest("PUT", body);
+  http.end();
+}
 
 // ---- rollback ---------------------------------------------------------
 
@@ -56,6 +107,14 @@ static uint32_t otaPullVersion() { return otaRunningVersion; }
 static void otaMarkRunningFirmwareGood() {
   if (otaMarkedGood) return;
   otaMarkedGood = true;
+
+  // Deferred from otaPullBegin: NTP and the network are both up by now, so a
+  // rollback detected at boot can finally be logged with a usable timestamp.
+  if (rolledBackFrom && otaRtdbHost) {
+    otaLogEvent(otaRtdbHost, rolledBackFrom, otaRunningVersion, "rolled-back",
+                "new image did not confirm; reverted");
+    rolledBackFrom = 0;
+  }
 
   const esp_partition_t *run = esp_ota_get_running_partition();
   esp_ota_img_states_t st;
@@ -73,7 +132,9 @@ static void otaMarkRunningFirmwareGood() {
   otaPrefs.end();
 }
 
-static void otaPullBegin(const char *deviceId, uint32_t versionCode) {
+static void otaPullBegin(const char *rtdbHost, const char *deviceId,
+                         uint32_t versionCode) {
+  otaRtdbHost = rtdbHost;
   otaDeviceId = deviceId;
   otaRunningVersion = versionCode;
 
@@ -87,6 +148,7 @@ static void otaPullBegin(const char *deviceId, uint32_t versionCode) {
     otaPrefs.putUInt("bad", pending);
     otaPrefs.remove("pending");
     otaLastStatus = "v" + String(pending) + " rolled back, marked bad";
+    rolledBackFrom = pending;
   }
   otaPrefs.end();
 }
@@ -148,6 +210,8 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
     otaLastStatus = "GET " + String(code);
     otaFailures++;
     http.end();
+    otaLogEvent(otaRtdbHost, otaRunningVersion, version, "download-failed",
+                "HTTP " + String(code));
     return false;
   }
 
@@ -157,6 +221,16 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
     otaFailures++;
     http.end();
     return false;
+  }
+
+  // Clear any INVALID/ABORTED marking on the slot we are about to write.
+  // Without this a slot that once failed verification is refused by
+  // esp_ota_set_boot_partition() permanently, and the only other cure is a
+  // USB chip erase.
+  esp_err_t clr = esp_ota_erase_last_boot_app_partition();
+  if (clr != ESP_OK && clr != ESP_ERR_NOT_FOUND) {
+    otaLastStatus = "erase_last_boot: " + String(esp_err_to_name(clr));
+    // Not fatal on its own -- the write may still succeed -- so continue.
   }
 
   if (!Update.begin(len)) {
@@ -182,12 +256,48 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
     return false;
   }
   if (!Update.end(true)) {
-    otaLastStatus = "Update.end: " + String(Update.errorString());
+    // Update.errorString() collapses every activate failure into one message,
+    // so ask esp_ota_set_boot_partition() directly for the underlying reason.
+    String why = Update.errorString();
+    // ESP_ERR_OTA_VALIDATE_FAILED means the slot does not read back as a valid
+    // image. Verify the first bytes directly so a bad flash region is
+    // distinguishable from OTA bookkeeping: a mismatch here is hardware.
+    {
+      const esp_partition_t *t = esp_ota_get_next_update_partition(nullptr);
+      uint8_t hdr[16] = {0};
+      if (t && esp_partition_read(t, 0, hdr, sizeof(hdr)) == ESP_OK) {
+        char hex[40];
+        snprintf(hex, sizeof(hex), "%02X%02X%02X%02X", hdr[0], hdr[1], hdr[2],
+                 hdr[3]);
+        why += " slot_hdr=" + String(hex);  // a good image starts E9
+      }
+    }
+    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+    if (target) {
+      esp_err_t e = esp_ota_set_boot_partition(target);
+      why += " | set_boot_partition=" + String((int)e) + " (" +
+             String(esp_err_to_name(e)) + ")";
+
+      esp_ota_img_states_t st;
+      if (esp_ota_get_state_partition(target, &st) == ESP_OK)
+        why += " target_state=" + String((int)st);
+
+      const esp_partition_t *run = esp_ota_get_running_partition();
+      if (run) why += " running=" + String(run->label);
+    }
+    otaLastStatus = "install failed: " + why;
     otaFailures++;
+    otaLogEvent(otaRtdbHost, otaRunningVersion, version, "install-failed", why);
     return false;
+    // Note: no retry here. The image is written; if activation was refused,
+    // the cause is recorded above and a later attempt starts clean thanks to
+    // the erase at the top of this function.
   }
 
   otaLastStatus = "installed v" + String(version) + ", rebooting";
+  // Written before the reboot: after it, this firmware no longer exists to
+  // report what it did.
+  otaLogEvent(otaRtdbHost, otaRunningVersion, version, "installed", "");
   delay(500);
   ESP.restart();
   return true;  // not reached

@@ -54,10 +54,10 @@ static const uint16_t REG_HUMID  = 0x0001;  // value is %RH x10
 static const char *DEVICE_ID = "pond-site";
 static const char *DEVICE_NAME = "fish-pond-site";
 static const char *DEVICE_SCOPE = "site";
-static const char *FW_VERSION = "a4-2026.08.31";
+static const char *FW_VERSION = "a5-2026.08.31";
 // Monotonic; RTDB /firmware/pond-site/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 4;
+static const uint32_t FW_VERSION_CODE = 5;
 
 // The probe's second register tracks temperature inversely and in lockstep
 // (~3% per degree), so it is derived rather than an independent humidity
@@ -393,7 +393,7 @@ void setup() {
   logLine("boot ok ip=%s rssi=%d time=%s",
           WiFi.localIP().toString().c_str(), WiFi.RSSI(),
           time(nullptr) > 1600000000 ? "synced" : "NOT SYNCED");
-  otaPullBegin(DEVICE_ID, FW_VERSION_CODE);
+  otaPullBegin(RTDB_HOST, DEVICE_ID, FW_VERSION_CODE);
   logLine("fw v%lu, pull-ota: %s", (unsigned long)FW_VERSION_CODE,
           otaPullStatus().c_str());
 

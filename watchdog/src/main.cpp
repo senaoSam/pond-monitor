@@ -43,10 +43,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b7-2026.08.31";
+static const char *FW_VERSION = "b12-2026.08.31";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 7;
+static const uint32_t FW_VERSION_CODE = 12;
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 
@@ -759,7 +759,7 @@ void setup() {
   logLine("boot ok ip=%s ssid=%s time=%s",
           WiFi.localIP().toString().c_str(), connectedSsid,
           time(nullptr) > 1600000000 ? "synced" : "NOT SYNCED");
-  otaPullBegin(DEVICE_ID, FW_VERSION_CODE);
+  otaPullBegin(RTDB_HOST, DEVICE_ID, FW_VERSION_CODE);
   logLine("fw v%lu, pull-ota: %s", (unsigned long)FW_VERSION_CODE,
           otaPullStatus().c_str());
 
