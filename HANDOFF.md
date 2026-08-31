@@ -102,9 +102,14 @@ dio(時序裕度大得多)而非嘗試修復 qio 的理由。此點無法遠端�
   - [ ] 推一版故意連不上 WiFi 的 → 驗證能否自救
   - [ ] OTA 進行到一半拔電 → 驗證半寫入狀態能恢復
   - [ ] 改掉 WiFi 密碼 → 驗證後備機制
-- [ ] **A 更新到新版 `shared/PullOta`**(A 仍跑 v6 舊版;新版含探針與
-      下載逾時保護)。A 的 qio 正常,platformio 不必改;發 pond-site 新版
-      走同一套 `tools/release.sh pond-site`
+- [ ] **A 更新到新版 `shared/PullOta`**——目前部署前最大的殘餘風險。
+      A 仍跑 v6 舊版:下載遇斷線會卡死 loop(舊 `writeStream` 不返回,
+      B 之前就是這樣當機的),也沒有任何診斷工具。發 pond-site 新版走
+      同一套 `tools/release.sh pond-site`,更新動作本身同時驗證 A 的
+      拉取路徑仍健康。
+      注意:**A 的 qio 讀取從未實測**(v5→v6 成功史只是間接證據);
+      platformio 先不動,更新後看狀態頁的 `raw sample ctor/setup` 兩行
+      確認 raw 讀健康,再決定要不要跟進 dio
 - [ ] A 的板子若要重燒,先試 esptool 自動 reset(B 已證明可行,A 未測)
 
 ## 使用者的偏好與已定決策
