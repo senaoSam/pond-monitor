@@ -42,6 +42,7 @@
 #include <esp_partition.h>
 #include <esp_image_format.h>
 #include <esp_ota_ops.h>
+#include <esp_task_wdt.h>
 
 // How many times a version that failed to confirm is retried before it is
 // treated as genuinely broken. Small, because each retry costs a download.
@@ -255,7 +256,15 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
     // Erasing the whole slot is slower than letting Update.begin() do it, but
     // it is what actually clears a stale header, and this runs at most once
     // per update.
-    esp_err_t te = esp_partition_erase_range(tgt, 0, tgt->size);
+    // In slices, feeding the watchdog between them: erasing 6.5MB takes long
+    // enough on its own to trip the 120s timer.
+    const size_t SLICE = 256 * 1024;
+    esp_err_t te = ESP_OK;
+    for (size_t off = 0; off < tgt->size && te == ESP_OK; off += SLICE) {
+      size_t n = tgt->size - off < SLICE ? tgt->size - off : SLICE;
+      te = esp_partition_erase_range(tgt, off, n);
+      esp_task_wdt_reset();
+    }
     if (te != ESP_OK)
       otaLastStatus = "erase target: " + String(esp_err_to_name(te));
   }
@@ -267,21 +276,68 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
     return false;
   }
 
-  // Remember the version we are moving to *before* rebooting, so a rollback is
-  // detectable on the next boot.
+  // Read the body in chunks rather than handing the stream to
+  // Update.writeStream(). That call blocks until the whole image arrives, and
+  // when the far end resets the connection mid-download it does not return at
+  // all -- observed on the console: a "Connection reset by peer" at 57s, then
+  // silence until the 120s task watchdog aborted the board. Owning the loop
+  // makes it possible to feed the watchdog and to give up on a stall.
+  const uint32_t STALL_MS = 15000;
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t buf[1460];
+  size_t written = 0;
+  uint32_t lastProgress = millis();
+  bool stalled = false;
+
+  while (written < (size_t)len && http.connected()) {
+    esp_task_wdt_reset();  // a slow download is not a hung loop
+
+    size_t avail = stream->available();
+    if (!avail) {
+      if (millis() - lastProgress > STALL_MS) { stalled = true; break; }
+      delay(10);
+      continue;
+    }
+    if (avail > sizeof(buf)) avail = sizeof(buf);
+    int got = stream->readBytes(buf, avail);
+    if (got <= 0) {
+      if (millis() - lastProgress > STALL_MS) { stalled = true; break; }
+      continue;
+    }
+    if (Update.write(buf, got) != (size_t)got) {
+      otaLastStatus = "write: " + String(Update.errorString());
+      otaFailures++;
+      Update.abort();
+      http.end();
+      otaLogEvent(otaRtdbHost, otaRunningVersion, version, "download-failed",
+                  otaLastStatus);
+      return false;
+    }
+    written += got;
+    lastProgress = millis();
+  }
+  esp_task_wdt_reset();
+  http.end();
+
+  if (stalled || written != (size_t)len) {
+    otaLastStatus = (stalled ? "stalled at " : "short read ") +
+                    String(written) + "/" + String(len);
+    otaFailures++;
+    Update.abort();
+    // Log as a download failure, not an install one: nothing was activated,
+    // and the running firmware is untouched.
+    otaLogEvent(otaRtdbHost, otaRunningVersion, version, "download-failed",
+                otaLastStatus);
+    return false;
+  }
+
+  // Only now record what we are moving to. Writing this before the download
+  // meant an interrupted download looked, on the next boot, exactly like an
+  // image that had booted and failed to confirm -- so a version that was never
+  // installed got marked bad and skipped.
   otaPrefs.begin("fw", false);
   otaPrefs.putUInt("pending", version);
   otaPrefs.end();
-
-  size_t written = Update.writeStream(*http.getStreamPtr());
-  http.end();
-
-  if (written != (size_t)len) {
-    otaLastStatus = "short write " + String(written) + "/" + String(len);
-    otaFailures++;
-    Update.abort();
-    return false;
-  }
   if (!Update.end(true)) {
     // Update.errorString() collapses every activate failure into one message,
     // so ask esp_ota_set_boot_partition() directly for the underlying reason.
