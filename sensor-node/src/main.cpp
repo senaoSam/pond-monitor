@@ -27,6 +27,7 @@
 
 #include <ArduinoOTA.h>
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -54,10 +55,10 @@ static const uint16_t REG_HUMID  = 0x0001;  // value is %RH x10
 static const char *DEVICE_ID = "pond-site";
 static const char *DEVICE_NAME = "fish-pond-site";
 static const char *DEVICE_SCOPE = "site";
-static const char *FW_VERSION = "a7-2026.09.01";
+static const char *FW_VERSION = "a8-2026.09.01";
 // Monotonic; RTDB /firmware/pond-site/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 7;
+static const uint32_t FW_VERSION_CODE = 8;
 
 // The probe's second register tracks temperature inversely and in lockstep
 // (~3% per degree), so it is derived rather than an independent humidity
@@ -81,6 +82,16 @@ static const uint32_t REPLY_TIMEOUT_MS = 200;
 // request count negligible.
 static const uint32_t FW_POLL_FIRST_MS = 60UL * 1000;
 static const uint32_t FW_POLL_INTERVAL_MS = 30UL * 60 * 1000;
+
+// The default task WDT (5s, watching IDLE0) aborts a pull update on this
+// board: PullOta erases the whole 6.4MB target slot in one synchronous call,
+// which starves IDLE0 well past 5s (measured on v6: three identical
+// task_wdt/IDLE0 aborts ~9s into the download, ipc0 running -- flash ops).
+// Re-arming the same WDT at 120s both survives that erase and adds what v6
+// never had: a reboot if the loop itself ever hangs. Sized like the
+// watchdog's: one pull makes several blocking TLS calls plus the erase, so
+// anything past two minutes is a genuine stall, not slowness.
+static const uint32_t WDT_TIMEOUT_S = 120;
 
 // ---- state ------------------------------------------------------------
 static WebServer server(80);
@@ -354,6 +365,7 @@ static void handleRoot() {
   b += "uploads failed: " + String(uploadFail) + "\n";
   b += "probe read fails: " + String(readFail) + "\n";
   b += "last error: " + lastError + "\n";
+  b += "task wdt: " + String(WDT_TIMEOUT_S) + "s\n";
   b += "fw version: " + String(otaPullVersion()) + "\n";
   b += "fw pull: " + otaPullStatus() + " (tries " +
        String(otaPullAttempts()) + ", fails " +
@@ -527,6 +539,9 @@ void setup() {
   });
   ArduinoOTA.onEnd([]() { setLed(GREEN); });
   ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    // An upload holds the loop for ~30s, which would otherwise look like a
+    // stall to the watchdog.
+    esp_task_wdt_reset();
     // Alternate so a stalled update is visually distinct from a running one.
     setLed((done / 16384) % 2 ? BLUE : OFF);
   });
@@ -542,11 +557,20 @@ void setup() {
   server.on("/verify", handleVerify);
   server.on("/rawprobe", handleRawProbe);
   server.begin();
+
+  // Armed last, so a slow boot (WiFi retries, NTP wait) cannot trip it.
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);  // true = panic/reboot on timeout
+  esp_task_wdt_add(NULL);                  // watch the Arduino loop task
+  logLine("task watchdog armed at %lus", (unsigned long)WDT_TIMEOUT_S);
 }
 
 void loop() {
   static uint32_t nextUpload = 0;
   static uint32_t lastHistoryBucket = 0;
+
+  // Every path below returns through here, so one feed at the top covers them
+  // all; a stall anywhere in the cycle is exactly what should be caught.
+  esp_task_wdt_reset();
 
   ArduinoOTA.handle();
 
