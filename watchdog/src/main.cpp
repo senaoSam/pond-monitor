@@ -43,10 +43,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b6-2026.08.31";
+static const char *FW_VERSION = "b7-2026.08.31";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 6;
+static const uint32_t FW_VERSION_CODE = 7;
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 
@@ -316,11 +316,11 @@ static String discordNotify(const String &nodeId, const String &reason,
     content += "\\uff08\\u7b2c " + String(notifyCount) + " \\u6b21\\u63d0\\u9192\\uff09";
   content += "\\n";
   content += "\\u6700\\u5f8c\\u56de\\u5831\\uff1a" + localHhMm(lastSeen) + "\\n";
-  content += "\\u5df2\\u4e2d\\u65ad\\uff1a" + String(staleFor / 60) + " \\u5206\\u9418\\n";
+  content += "\\u5df2\\u4e2d\\u65b7\\uff1a" + String(staleFor / 60) + " \\u5206\\u9418\\n";
   if (lastReading.length())
     content += "\\u6700\\u5f8c\\u8b80\\u503c\\uff1a" + lastReading + "\\n";
   content += "\\u539f\\u56e0\\uff1a" + reason + "\\n";
-  content += "\\u9ede \\u2705 \\u56de\\u5831\\u5df2\\u77e5\\u6089\\uff08\\u9759\\u97f3 " +
+  content += "\\u9ede \\u2705 \\u56de\\u5831\\u5df2\\u77e5\\u6089\\uff08\\u975c\\u97f3 " +
              String(ACK_MUTE_S / 60) + " \\u5206\\u9418\\uff09";
 
   String body = "{\"content\":\"" + content + "\"}";
@@ -748,7 +748,11 @@ void setup() {
   blinkColor(GREEN, 5, 60);
 
   // Staleness is judged against wall-clock time, so NTP must land first.
-  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  // Taiwan is UTC+8. Stored timestamps are unix seconds either way, but
+  // every human-readable time -- the log lines and the Discord alert --
+  // goes through localtime_r(), so without the offset those all read 8
+  // hours early.
+  configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
   uint32_t ntpDeadline = millis() + 15000;
   while (time(nullptr) < 1600000000 && millis() < ntpDeadline) delay(200);
 

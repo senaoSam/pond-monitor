@@ -382,7 +382,11 @@ void setup() {
 
   // History keys and heartbeat freshness are both wall-clock based, so NTP
   // must land before the first publish.
-  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  // Taiwan is UTC+8. Stored timestamps are unix seconds either way, but
+  // every human-readable time -- the log lines and the Discord alert --
+  // goes through localtime_r(), so without the offset those all read 8
+  // hours early.
+  configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
   uint32_t ntpDeadline = millis() + 15000;
   while (time(nullptr) < 1600000000 && millis() < ntpDeadline) delay(200);
 
