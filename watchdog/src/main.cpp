@@ -43,10 +43,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b18-2026.09.01";
+static const char *FW_VERSION = "b19-2026.09.01";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 18;
+static const uint32_t FW_VERSION_CODE = 19;
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 
@@ -407,12 +407,16 @@ struct NotifyState {
   int sentCount;     // shown in the message so repeats are distinguishable
   bool alertActive;  // mirrors /alerts/<id>/active, so no refetch per check
   bool inUse;
+  time_t lastTry;    // when we last attempted a post, success or not
+  uint32_t failures; // consecutive failed posts, drives the backoff
 
   void reset() {
     msgId = "";
     lastSent = 0;
     ackedAt = 0;
     sentCount = 0;
+    lastTry = 0;
+    failures = 0;
   }
 };
 
@@ -466,6 +470,18 @@ static void driveNotifications(const String &id, uint32_t staleFor,
 
   if (st.lastSent && (uint32_t)(now - st.lastSent) < RENOTIFY_S) return;
 
+  // Back off after failures. RENOTIFY_S only paces *successful* posts, because
+  // lastSent is set on success -- so while Discord is unreachable (an outage,
+  // a bad token, a deleted channel) every cycle retried, once a minute, each
+  // one a failing TLS round-trip that slows the whole loop down. That is worst
+  // exactly when a node is down and an update might be needed. Double the wait
+  // per consecutive failure, capped.
+  if (st.failures) {
+    uint32_t wait = RENOTIFY_S << (st.failures - 1 < 4 ? st.failures - 1 : 4);
+    if ((uint32_t)(now - st.lastTry) < wait) return;
+  }
+  st.lastTry = now;
+
   // "超過 %d 分鐘未回報" -- exceeded N minutes without reporting
   String reason = "\\u8d85\\u904e " + String(staleFor / 60) +
                   " \\u5206\\u9418\\u672a\\u56de\\u5831";
@@ -476,9 +492,16 @@ static void driveNotifications(const String &id, uint32_t staleFor,
     st.msgId = msgId;
     st.lastSent = now;
     st.sentCount++;
+    st.failures = 0;
     notifySent++;
     logLine("discord notified for %s (msg %s, #%d)", id.c_str(),
             msgId.c_str(), st.sentCount);
+  } else {
+    st.failures++;
+    logLine("discord notify FAILED for %s (#%lu), next try in %lus",
+            id.c_str(), (unsigned long)st.failures,
+            (unsigned long)(RENOTIFY_S
+                            << (st.failures - 1 < 4 ? st.failures - 1 : 4)));
   }
 }
 
@@ -862,12 +885,19 @@ void loop() {
   publishSelf();
   otaMarkRunningFirmwareGood();
 
-  runCheck();
-
+  // Poll for firmware BEFORE running the checks, not after. Remote update is
+  // the only way to fix this board once it is deployed, so it must not sit
+  // behind the work most likely to be slow or to hang: runCheck() reaches out
+  // to Discord on every cycle while a node is stale, and a Discord outage
+  // turns that into a failing TLS round-trip each minute. The cycles where
+  // updating matters most are exactly the cycles where something is already
+  // wrong, so the update path goes first.
   static uint32_t nextFwPoll = FW_POLL_FIRST_MS;
   if ((int32_t)(millis() - nextFwPoll) >= 0) {
     nextFwPoll = millis() + FW_POLL_INTERVAL_MS;
     otaPullCheck(RTDB_HOST);
     logLine("fw check: %s", otaPullStatus().c_str());
   }
+
+  runCheck();
 }

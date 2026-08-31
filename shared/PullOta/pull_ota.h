@@ -42,6 +42,10 @@
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 
+// How many times a version that failed to confirm is retried before it is
+// treated as genuinely broken. Small, because each retry costs a download.
+static const uint32_t OTA_BAD_RETRY_LIMIT = 3;
+
 // ---- state ------------------------------------------------------------
 static Preferences otaPrefs;
 static const char *otaDeviceId = "";
@@ -116,18 +120,27 @@ static void otaMarkRunningFirmwareGood() {
     rolledBackFrom = 0;
   }
 
-  const esp_partition_t *run = esp_ota_get_running_partition();
-  esp_ota_img_states_t st;
-  if (esp_ota_get_state_partition(run, &st) == ESP_OK &&
-      st == ESP_OTA_IMG_PENDING_VERIFY) {
-    esp_ota_mark_app_valid_cancel_rollback();
-    otaLastStatus = "new firmware confirmed good";
-  }
+  // Mark valid unconditionally, not just when the state reads back as
+  // PENDING_VERIFY. Guarding on that state is what deadlocked the watchdog:
+  // esp_ota_erase_last_boot_app_partition() is documented as "when current app
+  // is marked as valid then you can erase previous app partition", so an image
+  // that never gets marked can never clear the other slot's marking -- and an
+  // image arrived at by rollback does not report PENDING_VERIFY, so it was
+  // skipped here. The old slot stayed marked, every later set_boot_partition()
+  // returned ESP_ERR_OTA_VALIDATE_FAILED, and the only escape was USB. The call
+  // is idempotent and safe when nothing is pending, so there is no reason to
+  // gate it.
+  esp_err_t mk = esp_ota_mark_app_valid_cancel_rollback();
+  otaLastStatus = (mk == ESP_OK) ? "running image marked valid"
+                                 : "mark_app_valid: " + String(esp_err_to_name(mk));
 
   // A version that got this far is known-good; clear any bad-version marker
   // for it so a later legitimate re-release of the same number is not skipped.
   otaPrefs.begin("fw", false);
-  if (otaPrefs.getUInt("bad", 0) == otaRunningVersion) otaPrefs.remove("bad");
+  if (otaPrefs.getUInt("bad", 0) == otaRunningVersion) {
+    otaPrefs.remove("bad");
+    otaPrefs.remove("badTries");
+  }
   otaPrefs.putUInt("running", otaRunningVersion);
   otaPrefs.end();
 }
@@ -223,14 +236,27 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
     return false;
   }
 
-  // Clear any INVALID/ABORTED marking on the slot we are about to write.
-  // Without this a slot that once failed verification is refused by
-  // esp_ota_set_boot_partition() permanently, and the only other cure is a
-  // USB chip erase.
+  // Clear any INVALID/ABORTED marking on the slot we are about to write, so a
+  // slot that once failed verification is not refused forever.
+  //
+  // Two calls, because they do different things and the first one is not
+  // enough. esp_ota_erase_last_boot_app_partition() acts on the *previous boot*
+  // partition, which is not necessarily the one we are about to write, and it
+  // only works when the running app is already marked valid. Erasing the target
+  // directly has neither restriction. Failures here are not fatal on their own
+  // -- the write may still succeed -- so both are recorded and we continue.
   esp_err_t clr = esp_ota_erase_last_boot_app_partition();
-  if (clr != ESP_OK && clr != ESP_ERR_NOT_FOUND) {
+  if (clr != ESP_OK && clr != ESP_ERR_NOT_FOUND)
     otaLastStatus = "erase_last_boot: " + String(esp_err_to_name(clr));
-    // Not fatal on its own -- the write may still succeed -- so continue.
+
+  const esp_partition_t *tgt = esp_ota_get_next_update_partition(nullptr);
+  if (tgt) {
+    // Erasing the whole slot is slower than letting Update.begin() do it, but
+    // it is what actually clears a stale header, and this runs at most once
+    // per update.
+    esp_err_t te = esp_partition_erase_range(tgt, 0, tgt->size);
+    if (te != ESP_OK)
+      otaLastStatus = "erase target: " + String(esp_err_to_name(te));
   }
 
   if (!Update.begin(len)) {
@@ -318,13 +344,29 @@ static void otaPullCheck(const char *rtdbHost) {
     return;
   }
 
-  otaPrefs.begin("fw", true);
+  // A version that failed to come up is skipped -- but not forever. The marker
+  // cannot tell "this build genuinely crashes on boot" apart from "the power
+  // was cut between writing the marker and confirming the boot", and treating
+  // the second case as permanent strands the board on an old version with no
+  // way back. Allow a bounded number of retries, so a genuinely broken build
+  // still stops being retried while an unlucky one gets another chance.
+  otaPrefs.begin("fw", false);
   uint32_t bad = otaPrefs.getUInt("bad", 0);
-  otaPrefs.end();
+  uint32_t badTries = otaPrefs.getUInt("badTries", 0);
+  bool skip = false;
   if (target == bad) {
-    otaLastStatus = "v" + String(target) + " known bad, skipping";
-    return;
+    if (badTries >= OTA_BAD_RETRY_LIMIT) {
+      otaLastStatus = "v" + String(target) + " failed " + String(badTries) +
+                      "x, skipping";
+      skip = true;
+    } else {
+      otaPrefs.putUInt("badTries", badTries + 1);
+      otaLastStatus = "v" + String(target) + " retry " +
+                      String(badTries + 1) + "/" + String(OTA_BAD_RETRY_LIMIT);
+    }
   }
+  otaPrefs.end();
+  if (skip) return;
 
   otaLastStatus = "updating v" + String(otaRunningVersion) + " -> v" +
                   String(target);
