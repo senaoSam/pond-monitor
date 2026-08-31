@@ -169,6 +169,13 @@ static void otaPullBegin(const char *rtdbHost, const char *deviceId,
     otaPrefs.remove("pending");
     otaLastStatus = "v" + String(pending) + " rolled back, marked bad";
     rolledBackFrom = pending;
+  } else if (pending) {
+    // pending == versionCode: the update we asked for is what booted, so the
+    // marker has served its purpose. Left in place it outlives the pull that
+    // wrote it and misfires later: A's first v8 boot (installed over espota,
+    // which never touches these prefs) found pending=6 from the v5->v6 pull
+    // two boots back and declared "v6 rolled back" -- a false fwlog entry.
+    otaPrefs.remove("pending");
   }
   otaPrefs.end();
 }
