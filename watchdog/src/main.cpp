@@ -45,10 +45,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b23-2026.09.01";
+static const char *FW_VERSION = "b24-2026.09.01";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 23;
+static const uint32_t FW_VERSION_CODE = 24;
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 
@@ -100,6 +100,13 @@ static void logLine(const char *fmt, ...) {
     snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d ", tm.tm_hour, tm.tm_min,
              tm.tm_sec);
   }
+
+  // Also to the console. The board keeps its log in RAM and serves it over
+  // HTTP, which is fine until the failure being chased is a crash -- then the
+  // buffer dies with the board and the only witness is the serial port, where
+  // the panic handler prints its backtrace too.
+  Serial.print(stamp);
+  Serial.println(line);
 
   logBuf += stamp;
   logBuf += line;
@@ -785,6 +792,34 @@ static void handleTestAck() {
 }
 
 void setup() {
+  // First thing, before anything that could fault: an OTA-installed image
+  // that dies during boot leaves no other trace. The delay gives the USB CDC
+  // link time to enumerate, or the opening lines are lost.
+  Serial.begin(115200);
+  delay(1500);
+  Serial.println();
+  Serial.printf("=== boot: %s (v%lu) reset=%s ===\n", FW_VERSION,
+                (unsigned long)FW_VERSION_CODE, resetReasonName());
+  {
+    const esp_partition_t *r = esp_ota_get_running_partition();
+    if (r)
+      Serial.printf("running=%s @0x%lx\n", r->label,
+                    (unsigned long)r->address);
+    for (int i = 0; i < 2; i++) {
+      const esp_partition_t *pp = esp_partition_find_first(
+          ESP_PARTITION_TYPE_APP,
+          i ? ESP_PARTITION_SUBTYPE_APP_OTA_1
+            : ESP_PARTITION_SUBTYPE_APP_OTA_0,
+          nullptr);
+      if (!pp) continue;
+      esp_ota_img_states_t st;
+      esp_err_t se = esp_ota_get_state_partition(pp, &st);
+      Serial.printf("%s: state=%s\n", pp->label,
+                    se == ESP_OK ? String((int)st).c_str()
+                                 : esp_err_to_name(se));
+    }
+  }
+
   blinkColor(BLUE, 2, 120);
 
   WiFi.mode(WIFI_STA);
