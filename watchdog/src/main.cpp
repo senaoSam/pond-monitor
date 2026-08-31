@@ -26,6 +26,7 @@
 
 #include <ArduinoOTA.h>
 #include <Arduino.h>
+#include <esp_flash.h>
 #include <esp_image_format.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
@@ -45,10 +46,31 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b30-2026.09.01";
+static const char *FW_VERSION = "b36-2026.09.01";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 30;
+static const uint32_t FW_VERSION_CODE = 36;
+
+// Two timed samples of the same 8-byte raw flash read, one from a global
+// constructor (before initArduino() runs psramInit()) and one from the top of
+// setup() (after). The read crosses a 32-byte boundary, which is the exact
+// shape the misread corrupts, so comparing the two says whether the corrupted
+// SPI1 state exists from startup or appears when the failing PSRAM probe runs.
+// Reads app1+0x1c: true content is the first segment header tail + app
+// descriptor magic, and the wrapped misread substitutes the image magic.
+static uint8_t rawSampleEarly[8], rawSampleSetup[8];
+static esp_err_t rawSampleEarlyErr = ESP_FAIL, rawSampleSetupErr = ESP_FAIL;
+
+static esp_err_t sampleCrossingRead(uint8_t out[8]) {
+  const esp_partition_t *p = esp_partition_find_first(
+      ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, nullptr);
+  if (!p) return ESP_ERR_NOT_FOUND;
+  return esp_partition_read(p, 0x1c, out, 8);
+}
+
+__attribute__((constructor)) static void earlyFlashSample() {
+  rawSampleEarlyErr = sampleCrossingRead(rawSampleEarly);
+}
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 
@@ -743,6 +765,10 @@ static void handleRoot() {
        String(otaPullFailures()) + ")\n";
   b += "last check: " + lastSummary + "\n";
   b += "last error: " + lastError + "\n";
+  b += "raw sample ctor : " + String(esp_err_to_name(rawSampleEarlyErr)) +
+       " " + probeHex(rawSampleEarly, 8) + "\n";
+  b += "raw sample setup: " + String(esp_err_to_name(rawSampleSetupErr)) +
+       " " + probeHex(rawSampleSetup, 8) + "\n";
   if (otaLastProbe.length()) {
     b += "---- last flash probe ----\n";
     b += otaLastProbe;
@@ -789,8 +815,14 @@ static void handleTestAlert() {
 // path and the mmap/cache path even agree on what is there.
 static void handleVerify() {
   const esp_partition_t *t = esp_ota_get_next_update_partition(nullptr);
+  if (server.hasArg("part"))
+    t = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                 server.arg("part") == "app0"
+                                     ? ESP_PARTITION_SUBTYPE_APP_OTA_0
+                                     : ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                 nullptr);
   if (!t) {
-    server.send(500, "text/plain", "no next update partition\n");
+    server.send(500, "text/plain", "no target partition\n");
     return;
   }
   size_t len = server.hasArg("len") ? (size_t)server.arg("len").toInt() : 0;
@@ -802,6 +834,63 @@ static void handleVerify() {
   server.send(200, "text/plain; charset=utf-8",
               String("target: ") + t->label + " @0x" +
                   String(t->address, HEX) + "\n" + otaLastProbe);
+}
+
+// Reads a window of a partition over both paths and returns the bytes
+// themselves, so the exact geometry of a misread can be mapped from outside:
+//   /rawprobe?part=app1&off=0x20&n=64&step=16
+// reads n bytes starting at off, the raw path in `step`-sized calls (the
+// mmap reference in one go), and prints both. Varying `step` measures whether
+// the corruption depends on transaction size; varying `off`, on address.
+static void handleRawProbe() {
+  String pname = server.hasArg("part") ? server.arg("part") : "app1";
+  const esp_partition_t *p = esp_partition_find_first(
+      ESP_PARTITION_TYPE_APP,
+      pname == "app0" ? ESP_PARTITION_SUBTYPE_APP_OTA_0
+                      : ESP_PARTITION_SUBTYPE_APP_OTA_1,
+      nullptr);
+  if (!p) {
+    server.send(500, "text/plain", "partition not found\n");
+    return;
+  }
+  size_t off = strtoul(server.arg("off").c_str(), nullptr, 0);
+  size_t n = server.hasArg("n") ? strtoul(server.arg("n").c_str(), nullptr, 0)
+                                : 64;
+  if (n < 1) n = 1;
+  if (n > 1024) n = 1024;
+  size_t step = server.hasArg("step")
+                    ? strtoul(server.arg("step").c_str(), nullptr, 0)
+                    : n;
+  if (step < 1 || step > n) step = n;
+  if (off + n > p->size) {
+    server.send(400, "text/plain", "window past partition end\n");
+    return;
+  }
+
+  uint8_t raw[1024];
+  memset(raw, 0xAA, sizeof(raw));
+  String errs;
+  for (size_t i = 0; i < n; i += step) {
+    size_t c = min(step, n - i);
+    esp_err_t e = esp_partition_read(p, off + i, raw + i, c);
+    if (e != ESP_OK) errs += String(esp_err_to_name(e)) + "@" + String(i) + " ";
+  }
+
+  String out = pname + " off=0x" + String(off, HEX) + " n=" + String(n) +
+               " step=" + String(step) + "\n";
+  if (errs.length()) out += "read errors: " + errs + "\n";
+  out += "raw:  " + probeHex(raw, n) + "\n";
+
+  const void *mem = nullptr;
+  spi_flash_mmap_handle_t mh = 0;
+  if (esp_partition_mmap(p, off, n, SPI_FLASH_MMAP_DATA, &mem, &mh) ==
+      ESP_OK) {
+    out += "mmap: " + probeHex((const uint8_t *)mem, n) + "\n";
+    spi_flash_munmap(mh);
+  } else {
+    out += "mmap: FAILED\n";
+  }
+  server.send(200, "text/plain; charset=utf-8", out);
 }
 
 // Reports whether the test message has been acknowledged yet.
@@ -817,6 +906,8 @@ static void handleTestAck() {
 }
 
 void setup() {
+  rawSampleSetupErr = sampleCrossingRead(rawSampleSetup);
+
   // First thing, before anything that could fault: an OTA-installed image
   // that dies during boot leaves no other trace. The delay gives the USB CDC
   // link time to enumerate, or the opening lines are lost.
@@ -912,6 +1003,7 @@ void setup() {
   server.on("/testack", handleTestAck);
   server.on("/fwcheck", handleFwCheck);
   server.on("/verify", handleVerify);
+  server.on("/rawprobe", handleRawProbe);
   server.begin();
 
   // Armed last, so a slow boot (WiFi retries, NTP wait) cannot trip it.
