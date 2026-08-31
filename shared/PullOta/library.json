@@ -1,0 +1,7 @@
+{
+  "name": "PullOta",
+  "version": "1.0.0",
+  "description": "Pull-based firmware update over HTTPS with rollback, shared by the pond nodes",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

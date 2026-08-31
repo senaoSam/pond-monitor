@@ -14,6 +14,11 @@
 //   4. publish its own /devices/watchdog/latest heartbeat, so a future node C
 //      can watch this one in turn
 //
+// This device hung in the field after ~9 days: it answered ping but its HTTP
+// and OTA ports were dead, so it had stopped watching and could not even be
+// updated remotely. A hardware watchdog now reboots it if the main loop stalls
+// past WDT_TIMEOUT_S -- a watchdog that cannot recover itself is not one.
+//
 // Sending the Discord message is deliberately NOT done here: the requirement
 // is to keep re-notifying until acknowledged from a phone, and an ESP32 cannot
 // receive Discord interactions. A Node.js bot owns that loop and clears
@@ -22,12 +27,15 @@
 #include <ArduinoOTA.h>
 #include <Arduino.h>
 #include <esp_ota_ops.h>
+#include <rom/rtc.h>
+#include <esp_task_wdt.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
 
+#include "pull_ota.h"
 #include "secrets.h"
 
 // ---- configuration ----------------------------------------------------
@@ -35,9 +43,21 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b1-2026.08.22";
+static const char *FW_VERSION = "b2-2026.08.31";
+// Monotonic; RTDB /firmware/watchdog/version is compared against this to
+// decide whether a pull-based update is due. Bump on every release.
+static const uint32_t FW_VERSION_CODE = 2;
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
+
+// Generous enough that a slow but working check never trips it: one check
+// makes several blocking TLS calls, each with a 12s timeout. Anything past
+// this is a genuine stall, not slowness.
+static const uint32_t WDT_TIMEOUT_S = 120;
+
+// Firmware polls are cheap but pointless to do often; 30 min bounds how
+// long a pushed fix takes to reach a board 300km away.
+static const uint32_t FW_POLL_INTERVAL_MS = 30UL * 60 * 1000;
 
 // A node counts as dead after missing this many of its own publish intervals.
 // A publishes every 60s, so 5 gives the agreed 5-minute threshold while
@@ -381,6 +401,7 @@ struct NotifyState {
   time_t lastSent;   // when we last posted
   time_t ackedAt;    // when the owner ticked it, 0 if never
   int sentCount;     // shown in the message so repeats are distinguishable
+  bool alertActive;  // mirrors /alerts/<id>/active, so no refetch per check
   bool inUse;
 
   void reset() {
@@ -512,30 +533,36 @@ static void runCheck() {
 
     summary += id + "=" + String(age) + "s" + (isStale ? "(STALE) " : "(ok) ");
 
-    // Compare against the stored alert so we only write on a transition.
-    String alertJson;
-    bool wasActive = false;
-    if (rtdbRequest("GET", "/alerts/" + id + "/active.json", "", &alertJson))
-      wasActive = (alertJson.indexOf("true") >= 0);
+    // Transition detection uses state this device already holds, rather than
+    // re-fetching /alerts/<id>/active every minute: each such fetch was a full
+    // TLS handshake (tens of KB of heap) to re-read a boolean we wrote
+    // ourselves. Cutting them removes most of the per-check allocation churn,
+    // which is the suspected cause of the hang this firmware recovers from.
+    // Cost of keeping it local: after a reboot the first check re-raises an
+    // alert that was already active, which errs toward notifying.
+    NotifyState &ns = notifyState(id);
+    bool wasActive = ns.alertActive;
 
     if (isStale && !wasActive) {
       String reason = "no publish for " + String(age) + "s (limit " +
                       String(limit) + "s)";
       if (writeAlert(id, true, (time_t)ts, reason)) {
         alertsRaised++;
+        ns.alertActive = true;
         logLine("ALERT RAISED %s: %s", id.c_str(), reason.c_str());
       } else {
         logLine("failed to raise alert for %s: %s", id.c_str(),
                 lastError.c_str());
       }
-      notifyState(id).reset();
+      ns.reset();
     } else if (!isStale && wasActive) {
       if (writeAlert(id, false, (time_t)ts, "publishing again")) {
         alertsCleared++;
+        ns.alertActive = false;
         logLine("alert cleared %s (age %lus)", id.c_str(),
                 (unsigned long)age);
       }
-      notifyState(id).reset();
+      ns.reset();
     }
 
     if (isStale) {
@@ -553,7 +580,9 @@ static void runCheck() {
 
   anyAlertActive = (stale > 0);
   lastSummary = summary.length() ? summary : "no other devices found";
-  logLine("check: %d ok, %d stale | %s", healthy, stale, lastSummary.c_str());
+  logLine("check: %d ok, %d stale | heap=%u blk=%u | %s", healthy, stale,
+          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+          lastSummary.c_str());
 }
 
 // Its own heartbeat, so a future node C can watch this watchdog in turn.
@@ -581,6 +610,36 @@ static bool publishMeta() {
   body += "}";
   return rtdbRequest("PUT", "/devices/" + String(DEVICE_ID) + "/meta.json",
                      body, nullptr);
+}
+
+// Names the cause of the most recent boot -- the first thing to look at when a
+// board has been rebooting on its own. The distinction that matters here:
+// RTC_SW_* is our own ESP.restart(), *WDT_* is a hang, BROWNOUT is the supply
+// sagging (a thin USB cable does this), and PANIC is a crash.
+// Enum names are the ESP32-S3 set; the S3 has no plain SW_CPU_RESET.
+static const char *resetReasonName() {
+  switch (rtc_get_reset_reason(0)) {
+    case POWERON_RESET:          return "POWERON (power applied)";
+    case RTC_SW_CPU_RESET:       return "SW_CPU (our ESP.restart)";
+    case RTC_SW_SYS_RESET:       return "SW_SYS (our ESP.restart)";
+    case DEEPSLEEP_RESET:        return "DEEPSLEEP";
+    case TG0WDT_SYS_RESET:       return "TASK_WDT0 (hang)";
+    case TG1WDT_SYS_RESET:       return "TASK_WDT1 (hang)";
+    case TG0WDT_CPU_RESET:       return "TASK_WDT0_CPU (hang)";
+    case TG1WDT_CPU_RESET:       return "TASK_WDT1_CPU (hang)";
+    case RTCWDT_SYS_RESET:       return "RTC_WDT (hang)";
+    case RTCWDT_CPU_RESET:       return "RTC_WDT_CPU (hang)";
+    case RTCWDT_RTC_RESET:       return "RTC_WDT_RTC (hang)";
+    case SUPER_WDT_RESET:        return "SUPER_WDT (hang)";
+    case RTCWDT_BROWN_OUT_RESET: return "BROWNOUT (power dip)";
+    case POWER_GLITCH_RESET:     return "POWER_GLITCH (power dip)";
+    case USB_UART_CHIP_RESET:    return "USB_UART (host reset)";
+    case USB_JTAG_CHIP_RESET:    return "USB_JTAG (host reset)";
+    case EFUSE_RESET:            return "EFUSE";
+    case GLITCH_RTC_RESET:       return "GLITCH";
+    case INTRUSION_RESET:        return "INTRUSION";
+    default:                     return "OTHER/PANIC (crash)";
+  }
 }
 
 // ---- http status page -------------------------------------------------
@@ -611,6 +670,17 @@ static void handleRoot() {
   b += "psram: " + String(ESP.getPsramSize()) + " (free " +
        String(ESP.getFreePsram()) + ")\n";
   b += "flash: " + String(ESP.getFlashChipSize()) + "\n";
+  // A reboot loop is diagnosed from these: why the last boot ended, how close
+  // the heap has ever come to empty, and the largest block still allocatable
+  // (each TLS session needs a big contiguous one).
+  b += "last reset: " + String(resetReasonName()) + "\n";
+  b += "min free heap ever: " + String(ESP.getMinFreeHeap()) + "\n";
+  b += "largest free block: " + String(ESP.getMaxAllocHeap()) + "\n";
+  b += "task wdt: " + String(WDT_TIMEOUT_S) + "s\n";
+  b += "fw version: " + String(otaPullVersion()) + "\n";
+  b += "fw pull: " + otaPullStatus() + " (tries " +
+       String(otaPullAttempts()) + ", fails " +
+       String(otaPullFailures()) + ")\n";
   b += "last check: " + lastSummary + "\n";
   b += "last error: " + lastError + "\n";
   b += "========================\n\n";
@@ -671,6 +741,10 @@ void setup() {
   logLine("boot ok ip=%s ssid=%s time=%s",
           WiFi.localIP().toString().c_str(), connectedSsid,
           time(nullptr) > 1600000000 ? "synced" : "NOT SYNCED");
+  otaPullBegin(DEVICE_ID, FW_VERSION_CODE);
+  logLine("fw v%lu, pull-ota: %s", (unsigned long)FW_VERSION_CODE,
+          otaPullStatus().c_str());
+
   logLine("meta publish: %s", publishMeta() ? "ok" : "FAILED");
 
   // Identify ourselves so the ack check can ignore the bot's own reaction.
@@ -694,6 +768,9 @@ void setup() {
   });
   ArduinoOTA.onEnd([]() { setLed(GREEN); });
   ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    // An upload holds the loop for ~30s, which would otherwise look like a
+    // stall to the watchdog.
+    esp_task_wdt_reset();
     setLed((done / 16384) % 2 ? BLUE : OFF);
   });
   ArduinoOTA.onError([](ota_error_t) {
@@ -707,10 +784,19 @@ void setup() {
   server.on("/testalert", handleTestAlert);
   server.on("/testack", handleTestAck);
   server.begin();
+
+  // Armed last, so a slow boot (WiFi retries, NTP wait) cannot trip it.
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);  // true = panic/reboot on timeout
+  esp_task_wdt_add(NULL);                  // watch the Arduino loop task
+  logLine("task watchdog armed at %lus", (unsigned long)WDT_TIMEOUT_S);
 }
 
 void loop() {
   static uint32_t nextCheck = 0;
+
+  // Every path below returns through here, so one feed at the top covers them
+  // all; a stall inside runCheck() is exactly what we want to be caught.
+  esp_task_wdt_reset();
 
   ArduinoOTA.handle();
 
@@ -747,4 +833,15 @@ void loop() {
 
   runCheck();
   publishSelf();
+
+  // A full cycle worked, so this image is proven -- commit it and cancel
+  // the rollback that would otherwise revert us on the next boot.
+  otaMarkRunningFirmwareGood();
+
+  static uint32_t nextFwPoll = FW_POLL_INTERVAL_MS;
+  if ((int32_t)(millis() - nextFwPoll) >= 0) {
+    nextFwPoll = millis() + FW_POLL_INTERVAL_MS;
+    otaPullCheck(RTDB_HOST);
+    logLine("fw check: %s", otaPullStatus().c_str());
+  }
 }
