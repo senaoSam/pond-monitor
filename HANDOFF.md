@@ -13,101 +13,111 @@
 | DEVICE_ID | `pond-site` | `watchdog` |
 | 板子序號 | CH343 `5CBC033443` | CH343 `5CBC033428` |
 | IP | 192.168.0.37 | 192.168.0.38 |
-| 韌體版本 | **6** | **20** |
+| 韌體版本 | **6** | **28**（USB 燒入） |
 | 拉取式 OTA | ✅ 正常（v5→v6 自我更新成功） | ❌ **失敗中**，見下 |
 | 功能 | 正常上傳水溫 | 正常監控 + Discord 告警 |
 
 兩片都在使用者台北家中運作，資料持續進 RTDB。**功能都正常** ——
 B 的告警邏輯 09-01 實測過（拔掉 A，5 分鐘門檻正確觸發，A 回來後自動解除）。
 
-**唯一問題是 B 無法遠端更新**，v20 是 USB 燒進去的。
+**唯一問題是 B 無法遠端更新**，v28 是 USB 燒進去的。
+工作目錄的原始碼是 v29（已 commit，release 已發布，但 B 裝不上）。
+
+09-01 凌晨的實測進度：Discord user id 已修正並**確認送達成功**
+（`discord notified for pond-site (msg 1544030776239194163)`）；
+告警偵測邏輯實測正確；OTA 卡死問題已修好（下載中斷不再讓板子當機）。
+剩下的就是 `VALIDATE_FAILED` 本身。
 
 最終部署：A 去魚塭、B 去南部家裡，開發者在北部 —— 所以兩片都必須能遠端更新。
 **B 現在不符合這個前提，出門前必須修好。**
 
 ## 未解決：B 的 OTA `ESP_ERR_OTA_VALIDATE_FAILED`
 
-**這題在 08-31 被標成「已結案」，那是錯的。** 09-01 又以完全相同的錯誤失敗，
-`v19 -> v20` 是在 USB 乾淨燒錄後、從 app0 寫 app1 的最乾淨情境下失敗的。
+**狀態：根因不明。已誤判七次，不要再憑推論下結論。**
 
-### 症狀
+A（`pond-site`）遠端更新正常。B（`watchdog`）不行，只能 USB 燒錄。
+兩片跑同一份 `shared/PullOta`、同樣的 `platformio.ini`。
+
+### 目前的症狀
+
+兩種失敗交替出現，取決於下載是否完整：
 
 ```
+# 下載中途斷線（我加的逾時保護正確接住，板子不再當機）
+fw pull: stalled at 751474/971120
+
+# 下載完整時
 install failed: Could Not Activate The Firmware slot_hdr=E905024F
+  app0_state=2(magic=E9 chip=9 seg=5)
+  app1_state=ERR:ESP_ERR_NOT_FOUND(magic=E9 chip=9 seg=5)
+  | target=app1@0x650000 size=6553600
   | set_boot_partition=5379 (ESP_ERR_OTA_VALIDATE_FAILED) running=app0
 ```
 
-A（`pond-site`）用同一份 `shared/PullOta`、同樣的 platformio 設定，OTA 正常。
-只有 B 會失敗，而且 USB 燒錄後能成功一到兩次，之後固定失敗。
-
-### 已用 esptool 直接驗證的硬體事實（09-01，不是推論）
-
-這些都查過了，都正常，不必重查：
-
-- flash 晶片真的是 16MB（`Manufacturer: c2 Device: 2018`，eFuse quad / 3.3V）
-- 分區表 `default_16MB.csv`：app0 `0x10000`、app1 `0x650000`，各 `0x640000`
-- otadata（`0xe000`）內容正常：`ota_seq=1`、`ota_state=0x2`（**VALID**）、CRC 正確
-- 寫入資料本身沒問題：`slot_hdr=E905024F`，magic `E9` 正確
-
-也就是說：來源分區狀態正常、目標分區寫得進去、記帳資料完好，**卻仍被拒絕**。
-
-### 下一步該怎麼查
-
-**不要再提假說了。** 這題已經誤判六次（見下），每次都是從「A 和 B 哪裡不一樣」
-推論因果、證據不足就宣告結案。
-
-該做的是**直接比對 A 和 B 的可觀測狀態**：
-
-1. 把 A 的 otadata（`0xe000`, `0x2000`）也 dump 出來，和 B 逐欄位比對
-2. 比對兩片的 bootloader（`0x0`, `0x8000`）與分區表（`0x8000`, `0x1000`）二進位
-3. 一片能更新、一片不能，差異必然落在某個可讀取的地方 —— 找出來，不要猜
-
-dump 指令（板子需 BOOT+RST 進下載模式）：
+序列埠（原生 USB 孔，COM5）另外拍到 bootloader 的抱怨：
 
 ```
-python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3   --port COMx --no-stub read_flash 0xe000 0x2000 otadata.bin
+E (115505) esp_image: Image hash failed - image is corrupt
 ```
 
-otadata 解析：每 `0x1000` 一份，前 4 bytes `ota_seq`、offset 24 是 `ota_state`、
-offset 28 是 CRC32（`zlib.crc32(seq_bytes, 0xffffffff)`，**不做最後的 xor**）。
-狀態值：`0x0 NEW`、`0x1 PENDING_VERIFY`、`0x2 VALID`、`0x3 INVALID`、
+### 已用 esptool 實測排除（不是推論，不要重查）
+
+| 項目 | A | B | 結果 |
+|---|---|---|---|
+| flash 晶片 | `c2 2018` 16MB quad 3.3V | 同左 | **相同** |
+| chip revision | v0.2 | v0.2 | **相同** |
+| bootloader `0x0-0x8000` | sha256 `6ac230d6941c798d…` | 同左 | **逐 byte 相同** |
+| 分區表 `0x8000` | app0@0x10000 app1@0x650000 各 0x640000 | 同左 | **逐 byte 相同** |
+| **otadata `0xe000`** | `seq=3`+`seq=2`，兩 sector 皆 VALID | **`seq=1`+ 空白** | **← 唯一差異** |
+
+**最關鍵的一項：** 失敗後把 B 的 app1 dump 出來（`read_flash 0x650000 0xEE000`），
+與 GitHub 上的 release **逐 byte 比對，971408 bytes 全部相同，零個不符**。
+
+**寫進去的資料是完美的，bootloader 卻說 hash 失敗。** 這是目前最核心的矛盾，
+也是唯一還沒被解釋的事實。
+
+其他已排除：PSRAM 宣告、heap 碎片化、分區表設定、`maximum_size` 覆寫、
+anti-rollback（`CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK` 未啟用；
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` 是開的）、映像格式、寫入方向、
+供電不足（換 USB 3.0 孔後不再當機，但 OTA 仍失敗）。
+
+### 唯一還沒查的差異：otadata
+
+B 的 otadata 第二個 sector 從未被寫過。ESP-IDF 的 OTA 記帳是雙緩衝，
+兩個 sector 輪流寫、靠 `ota_seq` 遞增決定新舊。A 的 `seq=3`/`seq=2`
+顯示它輪替過多次；B 停在 `seq=1`。
+
+**但因果方向未定** —— 可能是 B 一直失敗所以 seq 停住（結果而非原因）。
+
+下一步的候選動作（**未執行，需使用者同意**）：
+`esptool erase_region 0xe000 0x2000` 抹掉 B 的 otadata，讓記帳從零重建。
+抹掉後仍會從 app0 開機（v28 在那裡），風險低但不可逆。
+
+otadata 解析方式：每 `0x1000` 一份，前 4 bytes `ota_seq`、offset 24 `ota_state`、
+offset 28 CRC32（`zlib.crc32(seq_bytes, 0xffffffff)`，**不做最後 xor**）。
+狀態：`0x0 NEW`、`0x1 PENDING_VERIFY`、`0x2 VALID`、`0x3 INVALID`、
 `0x4 ABORTED`、`0xFFFFFFFF UNDEFINED`。
 
-### 已排除、不必重試
-
-- 分區表設定、`board_upload.maximum_size` 覆寫
-- PSRAM 宣告（`/fwlog` 證明 v10 無宣告也失敗；兩種狀態都失敗過）
-- heap 碎片化（`largest free block` 208KB，串流寫入不需連續空間）
-- anti-rollback（`CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK` 未啟用）
-- otadata 損壞（09-01 dump 出來是好的）
-- flash 容量造假（esptool 讀到真 16MB）
-- task watchdog 拖慢導致回滾（v19 在無告警、loop 正常的情況下同樣失敗）
-
-### 這題上犯過的錯（六次，避免重複）
+### 七次誤判（全部被後續證據推翻）
 
 1. 「B 沒有 PSRAM」→ eFuse 證明有 8MB
-2. 「`psram_type` 設錯」→ `qio` 也失敗
+2. 「`psram_type` 設錯該用 qio」→ qio 也失敗
 3. 「heap 碎片化」→ 208KB 連續空間充足
-4. 「分區被標記 INVALID」→ 錯誤碼不符（但方向其實最接近）
+4. 「分區被標記 INVALID」→ 當時以錯誤碼不符否定（方向其實最接近）
 5. 「PSRAM 宣告是唯一剩下的變數」→ `/fwlog` 證明 v10 無宣告也失敗
-6. 「otadata 的 `ota_state=0x2` 是 PENDING_VERIFY」→ **看錯 enum**，0x2 是 VALID
+6. 「otadata `state=0x2` 是 PENDING_VERIFY」→ **看錯 enum**，0x2 是 VALID
+7. 「v19 加的 target erase 是元凶」→ 移除後（v28）仍失敗。
+   當時只看「v13/v14 在它之前成功」就下結論，**沒去核對 v10→v11
+   在它之前也失敗過** —— 反例一直在 fwlog 裡
 
-共同模式：**拿片面差異當因果，樣本不足就宣告結案。** v13/v14 兩次成功就寫下
-「已結案」，是這次浪費最多時間的根源。
+**共同模式：拿 A/B 的片面差異當因果，樣本不足就宣告結案。**
+v13/v14 兩次成功就寫下「已結案」，是浪費最多時間的一次。
 
-### 已完成的韌性修正（在 v19/v20 裡，與根因無關但值得保留）
+### 給接手者的建議
 
-- 無條件呼叫 `esp_ota_mark_app_valid_cancel_rollback()`，不再只在
-  `PENDING_VERIFY` 時才標記
-- 寫入前直接 `esp_partition_erase_range()` 抹目標分區，不依賴
-  `esp_ota_erase_last_boot_app_partition()`（後者只作用於「上次開機的分區」，
-  且要求當前 app 已 valid）
-- 失敗版本改為重試 3 次（`OTA_BAD_RETRY_LIMIT`），不再永久黑名單 ——
-  原本無法區分「真的開機失敗」與「下載後斷電」
-- **OTA 輪詢移到 `runCheck()` 之前** —— 遠端更新是唯一的救援管道，
-  不該排在最會塞車的工作後面
-- Discord 發送失敗改指數退避 —— 原本 `RENOTIFY_S` 只節流成功發送，
-  失敗每分鐘重試，曾因此拖垮 loop 撞上 task watchdog
+不要再提第八個假說。資料寫入正確卻驗證失敗，這個矛盾指向
+**驗證時的讀取路徑**（flash 快取、mmap、SPI 時序），而不是資料內容。
+可考慮：在板子上直接呼叫 `esp_image_verify()` 並印出它拒絕的段落與偏移量。
 
 ## 部署前必須完成（東西還在台北時才能做）
 
@@ -129,7 +139,9 @@ offset 28 是 CRC32（`zlib.crc32(seq_bytes, 0xffffffff)`，**不做最後的 xo
 
 ### 待辦（依優先序）
 
-- [ ] **修好 B 的 OTA** —— 阻塞項，沒解決就不能部署
+- [ ] **修好 B 的 OTA** —— 阻塞項，沒解決就不能部署（根因不明，見上）
+- [ ] 序列埠除錯已可用：`Serial.begin()` 在 v24 加入，走**原生 USB 孔**
+      （COM5，VID 303A）；燒錄走 **CH343 孔**（COM6）。兩者要換孔
 - [ ] **WiFi 後備連線** —— 清單裡最可能真實發生的。連不上主 WiFi 超過 N 分鐘
       就開 AP，用手機連上去改設定。能救掉整類「網路變動」情境
 - [ ] **破壞性測試（只有現在能做）**：
