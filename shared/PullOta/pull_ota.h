@@ -40,6 +40,7 @@
 #include <WiFiClientSecure.h>
 #include <esp_err.h>
 #include <esp_partition.h>
+#include <esp_image_format.h>
 #include <esp_ota_ops.h>
 
 // How many times a version that failed to confirm is retried before it is
@@ -298,8 +299,42 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
         why += " slot_hdr=" + String(hex);  // a good image starts E9
       }
     }
+    // Why this much detail: set_boot_partition() has refused on this board
+    // across every theory tried so far, and target_state has never once
+    // appeared in the recorded message -- meaning esp_ota_get_state_partition()
+    // itself keeps failing, which nothing has chased down. Report the state of
+    // BOTH slots with their error codes, plus the image header the bootloader
+    // actually validates, so the next failure says which check rejects it
+    // instead of leaving it to be guessed at again.
+    {
+      const esp_partition_t *a0 = esp_partition_find_first(
+          ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, nullptr);
+      const esp_partition_t *a1 = esp_partition_find_first(
+          ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, nullptr);
+      for (int i = 0; i < 2; i++) {
+        const esp_partition_t *pp = i ? a1 : a0;
+        const char *nm = i ? " app1" : " app0";
+        if (!pp) { why += String(nm) + "=missing"; continue; }
+        esp_ota_img_states_t st;
+        esp_err_t se = esp_ota_get_state_partition(pp, &st);
+        why += String(nm) + "_state=";
+        why += (se == ESP_OK) ? String((int)st)
+                              : String("ERR:") + esp_err_to_name(se);
+        // The bootloader validates this header, not just the magic byte.
+        esp_image_header_t ih = {};
+        if (esp_partition_read(pp, 0, &ih, sizeof(ih)) == ESP_OK) {
+          char buf[48];
+          snprintf(buf, sizeof(buf), "(magic=%02X chip=%u seg=%u)", ih.magic,
+                   (unsigned)ih.chip_id, (unsigned)ih.segment_count);
+          why += buf;
+        }
+      }
+    }
+
     const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
     if (target) {
+      why += " | target=" + String(target->label) + "@0x" +
+             String(target->address, HEX) + " size=" + String(target->size);
       esp_err_t e = esp_ota_set_boot_partition(target);
       why += " | set_boot_partition=" + String((int)e) + " (" +
              String(esp_err_to_name(e)) + ")";

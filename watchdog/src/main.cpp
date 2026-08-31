@@ -26,6 +26,8 @@
 
 #include <ArduinoOTA.h>
 #include <Arduino.h>
+#include <esp_image_format.h>
+#include <esp_partition.h>
 #include <esp_ota_ops.h>
 #include <rom/rtc.h>
 #include <esp_task_wdt.h>
@@ -43,10 +45,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b21-2026.09.01";
+static const char *FW_VERSION = "b22-2026.09.01";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 21;
+static const uint32_t FW_VERSION_CODE = 22;
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 
@@ -697,6 +699,30 @@ static void handleRoot() {
   b += "psram: " + String(ESP.getPsramSize()) + " (free " +
        String(ESP.getFreePsram()) + ")\n";
   b += "flash: " + String(ESP.getFlashChipSize()) + "\n";
+  // Both OTA slots, always visible -- not only in a failure message. This is
+  // the state set_boot_partition() consults, and it has never been captured
+  // while the board was healthy, so there is no baseline to compare against.
+  for (int i = 0; i < 2; i++) {
+    const esp_partition_t *pp = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP,
+        i ? ESP_PARTITION_SUBTYPE_APP_OTA_1 : ESP_PARTITION_SUBTYPE_APP_OTA_0,
+        nullptr);
+    b += String(i ? "app1" : "app0") + ": ";
+    if (!pp) { b += "missing\n"; continue; }
+    esp_ota_img_states_t st;
+    esp_err_t se = esp_ota_get_state_partition(pp, &st);
+    b += "state=";
+    b += (se == ESP_OK) ? String((int)st)
+                        : String("ERR:") + esp_err_to_name(se);
+    esp_image_header_t ih = {};
+    if (esp_partition_read(pp, 0, &ih, sizeof(ih)) == ESP_OK) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), " magic=%02X chip=%u segs=%u", ih.magic,
+               (unsigned)ih.chip_id, (unsigned)ih.segment_count);
+      b += buf;
+    }
+    b += "\n";
+  }
   // A reboot loop is diagnosed from these: why the last boot ended, how close
   // the heap has ever come to empty, and the largest block still allocatable
   // (each TLS session needs a big contiguous one).
