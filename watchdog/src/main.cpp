@@ -43,10 +43,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b2-2026.08.31";
+static const char *FW_VERSION = "b6-2026.08.31";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 2;
+static const uint32_t FW_VERSION_CODE = 6;
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 
@@ -55,8 +55,12 @@ static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 // this is a genuine stall, not slowness.
 static const uint32_t WDT_TIMEOUT_S = 120;
 
-// Firmware polls are cheap but pointless to do often; 30 min bounds how
-// long a pushed fix takes to reach a board 300km away.
+// The first poll runs a minute after boot, so power-cycling a board is
+// itself a way to pull an update promptly -- useful when a relative can
+// reach the plug but nothing can reach the board. Steady-state polling is
+// half-hourly, which is frequent enough for firmware and keeps the
+// request count negligible.
+static const uint32_t FW_POLL_FIRST_MS = 60UL * 1000;
 static const uint32_t FW_POLL_INTERVAL_MS = 30UL * 60 * 1000;
 
 // A node counts as dead after missing this many of its own publish intervals.
@@ -696,6 +700,16 @@ static void handleCheckNow() {
 
 // Posts a real Discord alert on demand, so the notification path can be
 // verified without waiting for an actual outage.
+// Forces a firmware check now instead of waiting for the poll interval.
+static void handleFwCheck() {
+  otaPullCheck(RTDB_HOST);
+  // If an update was applied the board reboots inside the call above, so
+  // reaching this line means no update happened.
+  server.send(200, "text/plain; charset=utf-8",
+              "running v" + String(otaPullVersion()) + "\nresult: " +
+                  otaPullStatus() + "\n");
+}
+
 static void handleTestAlert() {
   // "手動測試" -- manual test
   String msgId = discordNotify("TEST", "\\u624b\\u52d5\\u6e2c\\u8a66", 0,
@@ -783,6 +797,7 @@ void setup() {
   server.on("/check", handleCheckNow);
   server.on("/testalert", handleTestAlert);
   server.on("/testack", handleTestAck);
+  server.on("/fwcheck", handleFwCheck);
   server.begin();
 
   // Armed last, so a slow boot (WiFi retries, NTP wait) cannot trip it.
@@ -838,7 +853,7 @@ void loop() {
   // the rollback that would otherwise revert us on the next boot.
   otaMarkRunningFirmwareGood();
 
-  static uint32_t nextFwPoll = FW_POLL_INTERVAL_MS;
+  static uint32_t nextFwPoll = FW_POLL_FIRST_MS;
   if ((int32_t)(millis() - nextFwPoll) >= 0) {
     nextFwPoll = millis() + FW_POLL_INTERVAL_MS;
     otaPullCheck(RTDB_HOST);

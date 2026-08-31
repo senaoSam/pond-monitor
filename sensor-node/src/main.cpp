@@ -33,6 +33,7 @@
 #include <WiFiClientSecure.h>
 #include <time.h>
 
+#include "pull_ota.h"
 #include "secrets.h"
 
 // ---- configuration ----------------------------------------------------
@@ -53,7 +54,10 @@ static const uint16_t REG_HUMID  = 0x0001;  // value is %RH x10
 static const char *DEVICE_ID = "pond-site";
 static const char *DEVICE_NAME = "fish-pond-site";
 static const char *DEVICE_SCOPE = "site";
-static const char *FW_VERSION = "a2-2026.08.22";
+static const char *FW_VERSION = "a4-2026.08.31";
+// Monotonic; RTDB /firmware/pond-site/version is compared against this to
+// decide whether a pull-based update is due. Bump on every release.
+static const uint32_t FW_VERSION_CODE = 4;
 
 // The probe's second register tracks temperature inversely and in lockstep
 // (~3% per degree), so it is derived rather than an independent humidity
@@ -69,6 +73,14 @@ static const uint32_t UPLOAD_INTERVAL_MS  = 60UL * 1000;
 static const uint32_t HISTORY_INTERVAL_MS = 5UL * 60 * 1000;
 
 static const uint32_t REPLY_TIMEOUT_MS = 200;
+
+// The first poll runs a minute after boot, so power-cycling a board is
+// itself a way to pull an update promptly -- useful when a relative can
+// reach the plug but nothing can reach the board. Steady-state polling is
+// half-hourly, which is frequent enough for firmware and keeps the
+// request count negligible.
+static const uint32_t FW_POLL_FIRST_MS = 60UL * 1000;
+static const uint32_t FW_POLL_INTERVAL_MS = 30UL * 60 * 1000;
 
 // ---- state ------------------------------------------------------------
 static WebServer server(80);
@@ -321,6 +333,10 @@ static void handleRoot() {
   b += "uploads failed: " + String(uploadFail) + "\n";
   b += "probe read fails: " + String(readFail) + "\n";
   b += "last error: " + lastError + "\n";
+  b += "fw version: " + String(otaPullVersion()) + "\n";
+  b += "fw pull: " + otaPullStatus() + " (tries " +
+       String(otaPullAttempts()) + ", fails " +
+       String(otaPullFailures()) + ")\n";
   b += "===============\n\n";
   b += logBuf;
   server.send(200, "text/plain; charset=utf-8", b);
@@ -338,6 +354,16 @@ static void handleNow() {
   server.send(ok ? 200 : 500, "text/plain",
               "t=" + String(t, 1) + " h=" + String(h, 1) +
                   (ok ? " published\n" : " publish FAILED: " + lastError + "\n"));
+}
+
+// Forces a firmware check now rather than waiting out the poll interval.
+static void handleFwCheck() {
+  otaPullCheck(RTDB_HOST);
+  // An applied update reboots inside the call above, so reaching
+  // here means nothing was installed.
+  server.send(200, "text/plain; charset=utf-8",
+              "running v" + String(otaPullVersion()) + "\nresult: " +
+                  otaPullStatus() + "\n");
 }
 
 void setup() {
@@ -363,6 +389,10 @@ void setup() {
   logLine("boot ok ip=%s rssi=%d time=%s",
           WiFi.localIP().toString().c_str(), WiFi.RSSI(),
           time(nullptr) > 1600000000 ? "synced" : "NOT SYNCED");
+  otaPullBegin(DEVICE_ID, FW_VERSION_CODE);
+  logLine("fw v%lu, pull-ota: %s", (unsigned long)FW_VERSION_CODE,
+          otaPullStatus().c_str());
+
   logLine("meta publish: %s", publishMeta() ? "ok" : "FAILED");
 
   // OTA is a bench convenience only: this board needs a manual BOOT+RST dance
@@ -390,6 +420,7 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/now", handleNow);
+  server.on("/fwcheck", handleFwCheck);
   server.begin();
 }
 
@@ -462,10 +493,21 @@ void loop() {
             withHistory ? " (+history)" : "");
     lastCycleOk = true;
     blinkColor(GREEN, 1, 60);
+
+    // A publish succeeded, so this image works -- commit it and
+    // cancel the rollback that would otherwise revert us.
+    otaMarkRunningFirmwareGood();
   } else {
     uploadFail++;
     logLine("publish FAILED: %s", lastError.c_str());
     lastCycleOk = false;
     blinkColor(YELLOW, 2, 300);
+  }
+
+  static uint32_t nextFwPoll = FW_POLL_FIRST_MS;
+  if ((int32_t)(millis() - nextFwPoll) >= 0) {
+    nextFwPoll = millis() + FW_POLL_INTERVAL_MS;
+    otaPullCheck(RTDB_HOST);
+    logLine("fw check: %s", otaPullStatus().c_str());
   }
 }

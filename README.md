@@ -95,6 +95,78 @@ cd board-check && pio run -t upload --upload-port COMx
 
 注意腳位角色與模組絲印相反：GPIO17 是 ESP32 的 RX、GPIO18 是 TX。
 
+## 遠端更新（板子自己更新，無需接線）
+
+板子在南部、開發在北部，所以更新是**板子主動拉取**，不是電腦推送：
+
+```
+改好韌體 → 上傳到 GitHub Releases → 把 RTDB 的版本號調高
+                                        ↓
+            板子每 5 分鐘讀一次版本號,發現變新就自己下載、重開
+```
+
+**家人完全不用碰板子**,只要有電和 WiFi。
+
+### 每片板子各自獨立
+
+一個 repo、一份 code、但**每片板子讀自己的 RTDB 節點、抓自己的 binary**：
+
+```
+/firmware/pond-site/  { version, url }   → 抓 pond-site.bin   (A)
+/firmware/watchdog/   { version, url }   → 抓 watchdog.bin    (B)
+/firmware/watchdog-2/ { version, url }   → 抓 watchdog.bin    (C,未來)
+```
+
+韌體讀的是 `/firmware/<DEVICE_ID>.json`,所以 **DEVICE_ID 決定它抓哪一份**。
+因此：
+
+- 更新 A 不會動到 B —— 可以先在一片上驗證再推另一片
+- C 之後和 B 共用同一份 binary,但版本各自控制
+- 新增節點只需在 RTDB 加一個 key,不必改任何程式
+
+Release tag 用 `<device>-v<code>`（例如 `watchdog-v5`、`pond-site-v3`）,
+一眼看出是哪片板子的。
+
+### 發布指令
+
+```bash
+tools/release.sh watchdog  "說明"     # 建置 → 發布 → 驗證可下載 → 更新 RTDB
+tools/release.sh pond-site "說明"
+```
+
+版本號從 `FW_VERSION_CODE` 讀取,所以改程式時只要把那個數字加一即可,
+不會和 release 不一致。腳本會**先確認 binary 真的下載得到才更新 RTDB**,
+避免板子輪詢到 404 而把好版本標記成壞的。
+
+輪詢節奏：**開機後約 1 分鐘第一次,之後每 30 分鐘。**
+所以請家人重新插電也是一種促使更新的方法。
+同網路時可用 `GET /fwcheck` 立即觸發。
+
+### 為什麼安全（回滾機制）
+
+遠端更新最怕推了壞韌體導致板子連不上網,從此無法再更新 —— 那就真的要寄回來。
+所以：
+
+1. 新韌體開機後**必須完成一次完整週期**（讀感測器/檢查 + 成功上傳）才會呼叫
+   `otaMarkRunningFirmwareGood()`
+2. 沒呼叫就重開 → **ESP32 自動退回舊韌體**（硬體層級,程式 crash 也有效）
+3. 回滾過的版本號被記為 `bad` 並跳過,避免無限重試迴圈
+
+### 發布新版的步驟
+
+```bash
+# 1. 改程式,並把 FW_VERSION_CODE 加一
+# 2. 建置
+cd watchdog && pio run -e esp32-s3-devkitc-1
+# 3. 發布
+gh release create fw-vN --title "Firmware vN" --notes "..."    .pio/build/esp32-s3-devkitc-1/firmware.bin
+# 4. 指向它
+curl -X PUT "$RTDB/firmware/watchdog.json" -H 'Content-Type: application/json'   -d '{"version":N,"url":"https://github.com/senaoSam/pond-monitor/releases/download/fw-vN/firmware.bin"}'
+```
+
+⚠️ **韌體 binary 含 WiFi 密碼與 Discord token,而 releases 是公開的。**
+這是刻意的決定（自用、非商用）。若要改善,把憑證移到 RTDB 讀取即可。
+
 ## 燒錄
 
 平常用 OTA，不需碰板子：
@@ -158,6 +230,7 @@ http://<ip>/now                   sensor-node: 立即讀取並上傳
 http://<ip>/check                 watchdog: 立即執行一次檢查
 http://<ip>/testalert             watchdog: 發送測試告警
 http://<ip>/testack?msg=<id>      watchdog: 查詢該訊息是否已確認
+http://<ip>/fwcheck               立即檢查韌體更新（兩者皆有）
 ```
 
 ## 告警行為
@@ -170,8 +243,10 @@ http://<ip>/testack?msg=<id>      watchdog: 查詢該訊息是否已確認
 
 ## 已知限制
 
-- **搬到魚塭後無法遠端更新或讀取狀態頁**（不同網路）。診斷靠 LED 顏色與
-  RTDB 資料是否更新。韌體含雙 WiFi 憑證，搬遷不需重燒。
+- **搬到魚塭後無法讀取狀態頁**（不同網路）。診斷靠 LED 顏色與 RTDB 資料是否
+  更新。**韌體更新不受影響** —— 板子自己拉取,見「遠端更新」。
+- **espota（推送式 OTA）在兩片板子上目前都失敗**,原因未查明：傳輸到 100%
+  後拒絕啟用。已被拉取式 OTA 取代,故不影響使用;首次燒錄仍需 USB。
 - **供電品質會影響 WiFi**。曾遇到細線造成電壓降，ESP32 在 WiFi 啟動時電流
   拉高即連線失敗（LED 持續藍閃）。部署請用品質良好的線與充電器。
 - **sensor-node 的原生 USB 孔（左）無法傳輸資料**，推測焊接時影響到
