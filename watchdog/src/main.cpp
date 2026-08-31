@@ -43,10 +43,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b14-2026.08.31";
+static const char *FW_VERSION = "b17-2026.08.31";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 14;
+static const uint32_t FW_VERSION_CODE = 17;
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 
@@ -850,12 +850,19 @@ void loop() {
     delay(5);
   }
 
-  runCheck();
+  // Confirm the image as soon as it has proven the things an update could
+  // plausibly break: WiFi is up and RTDB accepts a write. Everything after
+  // this point is ordinary work, and some of it is slow -- runCheck() posts to
+  // Discord on every cycle while a node is stale, which is enough to push the
+  // loop past the 120s task watchdog. v16 was rolled back and blacklisted that
+  // way: it never reached this call, because the pond node was unplugged and
+  // each cycle was doing a Discord round-trip. Confirming before that work
+  // means a genuinely broken image still reverts, but a merely slow one does
+  // not take the whole update path down with it.
   publishSelf();
-
-  // A full cycle worked, so this image is proven -- commit it and cancel
-  // the rollback that would otherwise revert us on the next boot.
   otaMarkRunningFirmwareGood();
+
+  runCheck();
 
   static uint32_t nextFwPoll = FW_POLL_FIRST_MS;
   if ((int32_t)(millis() - nextFwPoll) >= 0) {

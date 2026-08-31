@@ -36,6 +36,17 @@ CODE=$(grep -oE 'FW_VERSION_CODE = [0-9]+' "$DIR/src/main.cpp" | grep -oE '[0-9]
 TAG="${DEVICE}-v${CODE}"
 echo ">> $DEVICE version $CODE  (tag $TAG)"
 
+# The .bin is built from the working tree, but the tag GitHub creates points at
+# a commit -- so publishing with changes uncommitted ships a binary that no
+# commit corresponds to, and "what is actually running on the board?" stops
+# having an answer. Ignored files (secrets.h) are deliberately not counted.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "!! uncommitted changes -- commit before releasing, or the tag will not" >&2
+  echo "   match the firmware:" >&2
+  git status --short --untracked-files=no >&2
+  exit 1
+fi
+
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   echo "!! $TAG already exists -- bump FW_VERSION_CODE first" >&2
   exit 1
