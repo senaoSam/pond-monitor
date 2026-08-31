@@ -1,11 +1,14 @@
-# 交接筆記（2026-09-01,凌晨更新:B 的 OTA 已修復）
+# 交接筆記（2026-09-01,凌晨第二次更新:A 已更新到 v10,拉取路徑修復並雙 slot 驗證）
 
 給接手的 session。專案背景看 [README.md](README.md),這裡只寫**當下狀態**和
 **踩過的坑**。
 
-**B 無法遠端更新的問題已解決**——根因是這片板子的 flash 在 QIO 讀取指令下
-會把跨 32-byte 邊界的 SPI1 讀取「繞回」邊界(量測細節見下)。修法:改用
-`dio`。已用連續三次拉取更新(v36→app1、v37→app0、v38→app1)實測驗證。
+**兩片板子的遠端更新問題都已解決,且根因不同:**
+
+- **B**:flash 在 QIO 讀取下跨 32-byte 邊界繞回 → 改 `dio`(見下方 B 章節)
+- **A**(本次):v6 的 PullOta 在下載前同步抹除整個 6.4MB slot,把 IDLE0
+  餓死超過預設 task WDT 的 5 秒 → abort 重開,**v6 拉什麼都必死**。修法:
+  照 watchdog 的樣板把 task WDT 重設為 120 秒(v8)。詳見「A 的更新」章節
 
 ## 系統現況
 
@@ -14,12 +17,16 @@
 | DEVICE_ID | `pond-site` | `watchdog` |
 | 板子序號 | CH343 `5CBC033443` | CH343 `5CBC033428` |
 | IP | 192.168.0.37 | 192.168.0.38 |
-| 韌體版本 | **6** | **38**(拉取式 OTA 裝入) |
-| 拉取式 OTA | ✅ 正常 | ✅ **已修復**(dio;連續三次、兩個 slot 皆驗證) |
-| flash 讀取模式 | qio(此片正常) | **dio(必要,勿改回 qio)** |
+| 韌體版本 | **10**(拉取式 OTA 裝入) | **38**(拉取式 OTA 裝入) |
+| 拉取式 OTA | ✅ **已修復**(120s WDT;v9/v10 連續兩次、兩個 slot 皆驗證) | ✅ 已修復(dio;連續三次、兩個 slot 皆驗證) |
+| flash 讀取模式 | qio(**本次已實測健康**,見 qio 體檢) | **dio(必要,勿改回 qio)** |
+| task WDT | **120s,loop 有訂閱**(v8 起;v6 以前只有預設 5s/IDLE0) | 120s,loop 有訂閱 |
+| PSRAM | ❌ 初始化失敗(本次 UART 實測,見下) | ❌ 初始化失敗(與 OTA 無關) |
 | 功能 | 正常上傳水溫 | 正常監控 + Discord 告警 |
 
-兩片都在台北家中運作,資料持續進 RTDB。
+A 在台北家中運作、接在 PC 的 CH343 孔(COM3)上,資料持續進 RTDB。
+**B 被使用者暫時斷電**(2026-09-01 凌晨)——它沒壞,是刻意斷的,重新上電
+即恢復;RTDB 的 watchdog 心跳停在最後一筆屬預期。
 
 ## 已解決:B 的 `ESP_ERR_OTA_VALIDATE_FAILED`(誤判七次之後,靠量測收斂)
 
@@ -78,49 +85,118 @@ dio(時序裕度大得多)而非嘗試修復 qio 的理由。此點無法遠端�
   OTA 成功的,所以它與失敗無關。「抹除 otadata」的候選動作作廢。
 - 七次誤判清單與過程,留在 git 歷史(`a15f152` 之前的 HANDOFF 版本)。
 
-## 硬體注意事項(本次有更正)
+## 硬體注意事項(09-01 凌晨:A 的部分已全部實測)
 
-- **B 的 CH343 支援 esptool 自動進下載模式**——「兩片都需手動 BOOT+RST」
-  是錯的(A 未重測)。今晚 B 的所有 USB 燒錄都是全自動完成的。
-- **開啟 B 的 CH343 序列埠(COM6)會直接 reset 板子**(DTR/RTS 有作用)。
-  部署後遠端 session 別隨手開埠;08-31 fwlog 裡每次失敗後幾分鐘的神祕重開機
-  就是當時開序列埠監看造成的。
-- COM6(CH343)= UART0,載送 ESP-IDF 錯誤 log(`esp_image` 那些 E 行);
-  `Serial.print`(HWCDC)走原生 USB 孔(COM5)。
+- **同款板、兩種體質**(都已實測,別互相套用):
+  - **B 的 CH343 支援 esptool 自動進下載模式**;開它的埠(COM6)**會
+    reset 板子**(DTR/RTS 有作用)——部署後遠端 session 別隨手開埠
+  - **A 的 DTR/RTS 完全沒接到 EN/IO0**(esptool 30 秒換手 + EN 壓 3 秒,
+    0 掉包實測):USB 燒錄**必須手動 BOOT+RST**,但反過來**開 A 的埠
+    (本 PC 上是 COM3)百分之百安全**,可長掛序列監聽——本次抓 WDT
+    crash 就是靠這個
+- CH343 埠 = UART0,載送 ESP-IDF 錯誤 log(`task_wdt`/`esp_image`/
+  `psram` 那些 E 行)與 ROM 開機橫幅(含 reset 原因);`Serial.print`
+  (HWCDC)走原生 USB 孔。
 - A 的原生 USB 孔(左)不能傳資料(推測焊接影響 GPIO19/20),用 CH343 孔。
-- 細的 USB 線會讓 A 連不上 WiFi(電壓降)。
+- 細的 USB 線會讓 A 連不上 WiFi(電壓降)。本次整晚接 PC 的 USB 孔
+  供電+資料,WiFi -64dBm 穩定、兩次 OTA 無異常——手上這條線沒問題。
 - **之後採購新板**:先燒含 `/rawprobe` 的韌體,用跨界讀取
   (`/rawprobe?part=app1&off=0x1c&n=8`)確認 raw 讀健康,再決定 qio/dio。
 
-## 下一步:A 的更新(2026-09-01 深夜,使用者睡前授權的自主任務)
+## 已完成:A 的更新(2026-09-01 凌晨,使用者睡前授權的自主任務)
 
-**現場狀態:** 使用者已將 **B 暫時斷電**(勿連 192.168.0.38、勿因它離線而
-除錯;RTDB 的 watchdog 心跳停在最後一筆屬預期)。A 已用可傳資料的線接到
-PC 的 CH343 孔(序號 `5CBC033443`,埠號自己查)。使用者在睡覺,**遇到需要
-人手的情況就停手、把狀態寫進這份筆記**,不要等待也不要冒進。
+原計畫是 v6→v7 一次拉取。實際走了 v7→v8→v9→v10 四個版號,因為途中
+量到一個計畫沒預料的根因。全程無人手介入(使用者睡前按過一次 BOOT+RST
+做門檻測試、一次 RST 收尾,之後全遠端)。
 
-**目標:** A 從 v6 更新到 v7(新版 `shared/PullOta` + 診斷工具),並順便
-完成 A 的 qio 體檢。B 的部分已全部完成,**不要動 watchdog/ 的任何設定**。
+### 門檻測試結果(每句都有實測)
 
-**步驟與授權門檻(依序):**
+- **A 沒有自動救援**:開埠、esptool 標準 reset 脈衝、RTS(EN)壓低 3 秒,
+  A 全程 0 掉包、序列 0 bytes → **這片板的 DTR/RTS 沒接到 EN/IO0**
+  (板上電路問題,與 USB 線無關;platformio.ini 的舊註解其實早寫了)。
+  esptool 自動連線也因此失敗
+- **手動 BOOT+RST 後 esptool 全功能**:chip_id / flash_id 正常
+  (ESP32-S3 QFN56 rev v0.2、MAC `28:84:85:5c:95:f0`、flash `c2 2018`
+  16MB、eFuse quad、內嵌 PSRAM 8MB AP_3v3)→ 救援=需人手起頭,之後全軟體
+- **副產品:A 的 COM3 開埠完全不干擾板子**(正因 DTR/RTS 沒接)——
+  可以放心隨時掛序列監聽,B 的「開埠會 reset」警告**不適用於 A**
+- 依門檻邏輯走了保守路線:整晚只用拉取(rollback 保底)+ espota,
+  沒碰 USB 燒錄、沒動 platformio 設定
 
-1. 讀 sensor-node v6 的原始碼(git 裡 `ac32e46` 前後):確認有無 task WDT、
-   有無 `/fwcheck` 端點——這決定卡死時的自癒能力與觸發更新的方式
-2. **門檻測試(先驗救援能力,再做有風險的事):** 開一次 A 的 COM 埠,
-   預期看到 reset 開機橫幅(證明 DTR/RTS 有通);再跑 `esptool chip_id`
-   (證明能自動進下載模式)。每次會讓 A 斷線 10–20 秒,無妨(B 已斷電,
-   不會有人發告警)。**兩者都通 = 有和 B 同級的全自動救援,後續可放手做;
-   沒通 = 只做第 4–5 步(rollback 保底的拉取),其餘停手記錄**
-3. sensor-node/src/main.cpp 加上與 watchdog 相同的診斷(開機 raw sample
-   兩行、`/verify`、`/rawprobe`;都在 shared 與 watchdog 的程式裡有現成
-   範本),版號 bump 到 v7,commit
-4. `tools/release.sh pond-site` 發布 v7;觸發:有 `/fwcheck` 就 curl,
-   沒有就開埠 reset 一次(重開機 60 秒後會自己拉),再不行等 30 分輪詢
-5. 驗證:v7 起來、`marked valid`、fwlog 有 `installed`、狀態頁
-   `raw sample ctor/setup` 兩行與真實內容一致(= A 的 qio 體檢)
-6. 若 raw sample 顯示繞回(A 也有 B 的缺陷):照 B 的做法改 dio 發 v8,
-   同樣要連續多次拉取驗證——**先量測後結論,成功次數不足不寫結案**
-7. 全程更新這份筆記;記憶裡的紀律照舊:不接受沒有實測支撐的假說
+### 根因:v6 拉不動 v7,是結構性必死(UART 實測三連發)
+
+觸發 `/fwcheck` 後 curl 被 reset、A 重開回 v6、fwlog 無紀錄。掛 COM3
+監聽重試,抓到三次一模一樣的死法(~73 秒一輪,A 每次開機 60 秒後自動
+重試,等於**無限 crash 循環**;當下先把 RTDB 指回 v6 止血):
+
+```
+E task_wdt: Task watchdog got triggered ... - IDLE0 (CPU 0)
+Tasks currently running: CPU 0: ipc0 / CPU 1: IDLE1 → Aborting.
+```
+
+機制(源碼對照確認):`5a94ba1`(v6)在下載前加了
+`esp_ota_erase_last_boot_app_partition()`——**單一同步呼叫抹除整個
+6.4MB slot**,期間 flash 操作經 ipc0 獨占 CPU0,IDLE0 遠超過預設
+task WDT 的 5 秒 → abort。時間軸吻合(觸發後 ~9 秒死,2×TLS 約 4-5 秒
++ 抹除 5 秒)。這同時解釋:
+
+| 謎團 | 解釋 |
+|---|---|
+| 昨晚 v5→v6 為何成功 | v5 的 PullOta **沒有**這個抹除呼叫 |
+| B 為何連拉三次都活著 | watchdog 韌體把同一個 task WDT 重設為 120 秒 |
+| fwlog 為何沒紀錄 | WDT 在 `pending` 寫入與任何記錄之前就 abort |
+| 不是斷線卡死(記憶中 B 的舊病)| 這是 abort 重開,不是 writeStream 不返回 |
+
+### 修法與驗證
+
+- **v8**(commit `7037b27`)= v7 的全部內容 + watchdog 同款 task WDT
+  (120s、loop 訂閱、espota onProgress 餵狗)。**經 espota 送上**
+  (`pio run -e ota -t upload --upload-port 192.168.0.37`,espota 逐
+  sector 懶抹除、不會餓死 IDLE0,也是專案文件寫的日常路徑)——v6 在板上
+  時這是唯一可用的遠端路徑
+- **v9**(`c0a9085`)驗證拉取:release.sh + `/fwcheck` → **55 秒完成**
+  check+全 slot 抹除+下載+安裝+重開,marked valid
+- **v10**(`ac3bacf`)第二次拉取落在另一個 slot → v9→app0、v10→app1,
+  **連續兩次、兩個 slot 皆實測通過**;UART 全程只看到兩次 `rst:0xc`
+  (正常軟體重啟),零 WDT 錯誤
+- v9 還帶一個 shared/PullOta 修正:`pending` 標記在成功路徑從不清除,
+  導致 A 的 v8 首次開機把昨晚 v5→v6 留下的 `pending=6` 誤判成
+  「v6 rolled back」寫了**一筆假的 fwlog**(ts 1788206238,已在 RTDB
+  加註 note)。現在 pending 開機吻合即消耗。NVS 裡殘留 `bad=6` 無害
+  (版本只會往上)
+
+### A 的 qio 體檢:健康,維持 qio(結案)
+
+用 B 定案時的同一套探測,v8 起可隨時重測:
+
+- `raw sample ctor/setup`:兩行 `ESP_OK` 且內容一致、等於真實 bytes
+- `/rawprobe?part=app1&off=0x1c&n=8`:raw == mmap,**無** B 的繞回簽名
+  (`e905024f` 沒有出現在尾端);app0 同窗口也乾淨
+- 128 bytes 以 16B/64B 兩種粒度讀:與 mmap 逐 byte 一致
+- `/verify` 全映像:raw SHA == mmap SHA(970992 與 982928 bytes 各一次,
+  換 slot 後各測過)、diff chunks 0、`esp_image_verify: ESP_OK`
+
+「B 的繞回是單板個體差異」的推論成立。A 的 dio 跟進**不需要**。
+
+### 版號註記
+
+- `pond-site-v7`:GitHub release 存在但**從未裝上任何板子**(v6 拉不動它,
+  修好後直接跳過)。留著無害,RTDB 已指向 v10
+- `pond-site-v8`:**沒有** GitHub release / tag(espota 直送,對應 commit
+  `7037b27`)。tag 序列 v7→v9→v10 中間缺 8 是刻意的
+- 教訓:**release.sh 前必先 push**——`gh release create` 的 tag 建在
+  GitHub 遠端 main 上,v6 當年沒先 push,所以 `pond-site-v6` 這個 tag
+  指錯 commit(指向 `a2965f7`,實際 v6 源碼在 `5a94ba1`)。本次 v7/v9/v10
+  的 tag 都已核對正確
+
+### 其他本次確立的事實
+
+- **A 的 PSRAM 初始化也失敗**(UART 每次開機:`psram: PSRAM ID read
+  error: 0x00ffffff`,qio_opi 變體)。與 B 相同、與 OTA 無關、目前不需要
+  它,未解決但不阻塞。eFuse 明明說內嵌 8MB(AP_3v3)——之後有閒再查線路
+  模式(`psram_type = opi` 可能不對)
+- `.claude/settings.local.json`(已 gitignore)是本機 Claude Code 權限
+  allowlist,使用者授權建立,供夜間自主作業用
 
 ## 部署前必須完成(東西還在台北時才能做)
 
@@ -132,15 +208,11 @@ PC 的 CH343 孔(序號 `5CBC033443`,埠號自己查)。使用者在睡覺,**遇
   - [ ] 推一版故意連不上 WiFi 的 → 驗證能否自救
   - [ ] OTA 進行到一半拔電 → 驗證半寫入狀態能恢復
   - [ ] 改掉 WiFi 密碼 → 驗證後備機制
-- [ ] **A 更新到新版 `shared/PullOta`**——目前部署前最大的殘餘風險。
-      A 仍跑 v6 舊版:下載遇斷線會卡死 loop(舊 `writeStream` 不返回,
-      B 之前就是這樣當機的),也沒有任何診斷工具。發 pond-site 新版走
-      同一套 `tools/release.sh pond-site`,更新動作本身同時驗證 A 的
-      拉取路徑仍健康。
-      注意:**A 的 qio 讀取從未實測**(v5→v6 成功史只是間接證據);
-      platformio 先不動,更新後看狀態頁的 `raw sample ctor/setup` 兩行
-      確認 raw 讀健康,再決定要不要跟進 dio
-- [ ] A 的板子若要重燒,先試 esptool 自動 reset(B 已證明可行,A 未測)
+- [x] ~~A 更新到新版 `shared/PullOta`~~ **完成**(v10;v9/v10 雙 slot
+      拉取實證,120s WDT 修復拉取路徑,qio 體檢通過維持 qio——見上方
+      「A 的更新」章節)
+- [x] ~~A 的板子若要重燒,先試 esptool 自動 reset~~ **已測:不可行**,
+      A 必須手動 BOOT+RST(DTR/RTS 未接,量測見上)
 
 ## 使用者的偏好與已定決策
 
