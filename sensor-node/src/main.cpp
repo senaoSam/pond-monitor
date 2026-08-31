@@ -95,6 +95,27 @@ static volatile bool otaInProgress = false;
 static String logBuf;
 static const size_t LOG_MAX = 8000;
 
+// Two timed samples of the same 8-byte raw flash read, one from a global
+// constructor (before initArduino()) and one from the top of setup(). The
+// read crosses a 32-byte boundary, which is the exact shape the watchdog
+// board's qio misread corrupted -- this board's raw read path has never been
+// measured (its v5->v6 update succeeding is only indirect evidence), so these
+// two lines on the status page are its qualification. Reads app1+0x1c, same
+// window as the watchdog so the boards are directly comparable.
+static uint8_t rawSampleEarly[8], rawSampleSetup[8];
+static esp_err_t rawSampleEarlyErr = ESP_FAIL, rawSampleSetupErr = ESP_FAIL;
+
+static esp_err_t sampleCrossingRead(uint8_t out[8]) {
+  const esp_partition_t *p = esp_partition_find_first(
+      ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, nullptr);
+  if (!p) return ESP_ERR_NOT_FOUND;
+  return esp_partition_read(p, 0x1c, out, 8);
+}
+
+__attribute__((constructor)) static void earlyFlashSample() {
+  rawSampleEarlyErr = sampleCrossingRead(rawSampleEarly);
+}
+
 static void logLine(const char *fmt, ...) {
   char line[200];
   va_list ap;
@@ -337,6 +358,14 @@ static void handleRoot() {
   b += "fw pull: " + otaPullStatus() + " (tries " +
        String(otaPullAttempts()) + ", fails " +
        String(otaPullFailures()) + ")\n";
+  b += "raw sample ctor : " + String(esp_err_to_name(rawSampleEarlyErr)) +
+       " " + probeHex(rawSampleEarly, 8) + "\n";
+  b += "raw sample setup: " + String(esp_err_to_name(rawSampleSetupErr)) +
+       " " + probeHex(rawSampleSetup, 8) + "\n";
+  if (otaLastProbe.length()) {
+    b += "---- last flash probe ----\n";
+    b += otaLastProbe;
+  }
   b += "===============\n\n";
   b += logBuf;
   server.send(200, "text/plain; charset=utf-8", b);
@@ -366,7 +395,92 @@ static void handleFwCheck() {
                   otaPullStatus() + "\n");
 }
 
+// Runs the flash read-path probe against the slot the next update would use,
+// on demand. Same tool that diagnosed the watchdog's VALIDATE_FAILED: it says
+// whether the raw SPI path and the mmap/cache path agree on what is there.
+static void handleVerify() {
+  const esp_partition_t *t = esp_ota_get_next_update_partition(nullptr);
+  if (server.hasArg("part"))
+    t = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                 server.arg("part") == "app0"
+                                     ? ESP_PARTITION_SUBTYPE_APP_OTA_0
+                                     : ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                 nullptr);
+  if (!t) {
+    server.send(500, "text/plain", "no target partition\n");
+    return;
+  }
+  size_t len = server.hasArg("len") ? (size_t)server.arg("len").toInt() : 0;
+  FlashProbeResult r = flashProbe(t, len);
+  otaLastProbe = flashProbeReport(r, "");
+  logLine("probe %s: raw=%.8s mmap=%.8s diff=%d imgv=%s", t->label,
+          r.shaRaw.c_str(), r.shaMmap.c_str(), r.diffChunks,
+          esp_err_to_name(r.imgVerify));
+  server.send(200, "text/plain; charset=utf-8",
+              String("target: ") + t->label + " @0x" +
+                  String(t->address, HEX) + "\n" + otaLastProbe);
+}
+
+// Reads a window of a partition over both paths and returns the bytes
+// themselves, so the exact geometry of a misread can be mapped from outside:
+//   /rawprobe?part=app1&off=0x20&n=64&step=16
+// reads n bytes starting at off, the raw path in `step`-sized calls (the
+// mmap reference in one go), and prints both. Varying `step` measures whether
+// the corruption depends on transaction size; varying `off`, on address.
+static void handleRawProbe() {
+  String pname = server.hasArg("part") ? server.arg("part") : "app1";
+  const esp_partition_t *p = esp_partition_find_first(
+      ESP_PARTITION_TYPE_APP,
+      pname == "app0" ? ESP_PARTITION_SUBTYPE_APP_OTA_0
+                      : ESP_PARTITION_SUBTYPE_APP_OTA_1,
+      nullptr);
+  if (!p) {
+    server.send(500, "text/plain", "partition not found\n");
+    return;
+  }
+  size_t off = strtoul(server.arg("off").c_str(), nullptr, 0);
+  size_t n = server.hasArg("n") ? strtoul(server.arg("n").c_str(), nullptr, 0)
+                                : 64;
+  if (n < 1) n = 1;
+  if (n > 1024) n = 1024;
+  size_t step = server.hasArg("step")
+                    ? strtoul(server.arg("step").c_str(), nullptr, 0)
+                    : n;
+  if (step < 1 || step > n) step = n;
+  if (off + n > p->size) {
+    server.send(400, "text/plain", "window past partition end\n");
+    return;
+  }
+
+  uint8_t raw[1024];
+  memset(raw, 0xAA, sizeof(raw));
+  String errs;
+  for (size_t i = 0; i < n; i += step) {
+    size_t c = min(step, n - i);
+    esp_err_t e = esp_partition_read(p, off + i, raw + i, c);
+    if (e != ESP_OK) errs += String(esp_err_to_name(e)) + "@" + String(i) + " ";
+  }
+
+  String out = pname + " off=0x" + String(off, HEX) + " n=" + String(n) +
+               " step=" + String(step) + "\n";
+  if (errs.length()) out += "read errors: " + errs + "\n";
+  out += "raw:  " + probeHex(raw, n) + "\n";
+
+  const void *mem = nullptr;
+  spi_flash_mmap_handle_t mh = 0;
+  if (esp_partition_mmap(p, off, n, SPI_FLASH_MMAP_DATA, &mem, &mh) ==
+      ESP_OK) {
+    out += "mmap: " + probeHex((const uint8_t *)mem, n) + "\n";
+    spi_flash_munmap(mh);
+  } else {
+    out += "mmap: FAILED\n";
+  }
+  server.send(200, "text/plain; charset=utf-8", out);
+}
+
 void setup() {
+  rawSampleSetupErr = sampleCrossingRead(rawSampleSetup);
+
   blinkColor(BLUE, 2, 120);
 
   Serial1.begin(RS485_BAUD, SERIAL_8N1, PIN_RS485_RX, PIN_RS485_TX);
@@ -425,6 +539,8 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/now", handleNow);
   server.on("/fwcheck", handleFwCheck);
+  server.on("/verify", handleVerify);
+  server.on("/rawprobe", handleRawProbe);
   server.begin();
 }
 

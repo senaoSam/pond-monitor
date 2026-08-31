@@ -2,3 +2,5 @@
 .vscode/
 # WiFi / database credentials -- never commit
 **/src/secrets.h
+# Personal Claude Code permission settings -- machine-specific
+.claude/settings.local.json
