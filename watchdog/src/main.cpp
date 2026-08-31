@@ -45,10 +45,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b29-2026.09.01";
+static const char *FW_VERSION = "b30-2026.09.01";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 29;
+static const uint32_t FW_VERSION_CODE = 30;
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 
@@ -743,6 +743,10 @@ static void handleRoot() {
        String(otaPullFailures()) + ")\n";
   b += "last check: " + lastSummary + "\n";
   b += "last error: " + lastError + "\n";
+  if (otaLastProbe.length()) {
+    b += "---- last flash probe ----\n";
+    b += otaLastProbe;
+  }
   b += "========================\n\n";
   b += logBuf;
   server.send(200, "text/plain; charset=utf-8", b);
@@ -777,6 +781,27 @@ static void handleTestAlert() {
   server.send(200, "text/plain",
               "posted msg " + msgId + "\nreact to it, then GET /testack?msg=" +
                   msgId + "\n");
+}
+
+// Runs the flash read-path probe against the slot the next update would use,
+// on demand. This is how a VALIDATE_FAILED gets diagnosed remotely: the slot
+// still holds the rejected image, and the probe says whether the raw SPI
+// path and the mmap/cache path even agree on what is there.
+static void handleVerify() {
+  const esp_partition_t *t = esp_ota_get_next_update_partition(nullptr);
+  if (!t) {
+    server.send(500, "text/plain", "no next update partition\n");
+    return;
+  }
+  size_t len = server.hasArg("len") ? (size_t)server.arg("len").toInt() : 0;
+  FlashProbeResult r = flashProbe(t, len);
+  otaLastProbe = flashProbeReport(r, "");
+  logLine("probe %s: raw=%.8s mmap=%.8s diff=%d imgv=%s", t->label,
+          r.shaRaw.c_str(), r.shaMmap.c_str(), r.diffChunks,
+          esp_err_to_name(r.imgVerify));
+  server.send(200, "text/plain; charset=utf-8",
+              String("target: ") + t->label + " @0x" +
+                  String(t->address, HEX) + "\n" + otaLastProbe);
 }
 
 // Reports whether the test message has been acknowledged yet.
@@ -886,6 +911,7 @@ void setup() {
   server.on("/testalert", handleTestAlert);
   server.on("/testack", handleTestAck);
   server.on("/fwcheck", handleFwCheck);
+  server.on("/verify", handleVerify);
   server.begin();
 
   // Armed last, so a slow boot (WiFi retries, NTP wait) cannot trip it.

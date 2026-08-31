@@ -44,6 +44,8 @@
 #include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
 
+#include "flash_probe.h"
+
 // How many times a version that failed to confirm is retried before it is
 // treated as genuinely broken. Small, because each retry costs a download.
 static const uint32_t OTA_BAD_RETRY_LIMIT = 3;
@@ -59,6 +61,9 @@ static uint32_t rolledBackFrom = 0;
 static const char *otaRtdbHost = nullptr;
 static String otaLastStatus = "idle";
 static uint32_t otaAttempts = 0, otaFailures = 0;
+// Full text of the last read-path probe (see flash_probe.h), kept so the
+// status page can show it after a failure; the fwlog only gets a summary.
+static String otaLastProbe = "";
 
 // Exposed so a status page can show why an update is or is not happening.
 static String otaPullStatus() { return otaLastStatus; }
@@ -282,6 +287,14 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
   uint32_t lastProgress = millis();
   bool stalled = false;
 
+  // Hash the bytes as they arrive. After a failed activation this is compared
+  // against what the flash reads back (see flash_probe.h): together they
+  // separate "the data arrived wrong", "the data was written wrong" and "the
+  // data is fine but the verify path reads it wrong" by measurement.
+  mbedtls_sha256_context dlSha;
+  mbedtls_sha256_init(&dlSha);
+  mbedtls_sha256_starts_ret(&dlSha, 0);
+
   while (written < (size_t)len && http.connected()) {
     esp_task_wdt_reset();  // a slow download is not a hung loop
 
@@ -302,15 +315,25 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
       otaFailures++;
       Update.abort();
       http.end();
+      mbedtls_sha256_free(&dlSha);
       otaLogEvent(otaRtdbHost, otaRunningVersion, version, "download-failed",
                   otaLastStatus);
       return false;
     }
+    mbedtls_sha256_update_ret(&dlSha, buf, got);
     written += got;
     lastProgress = millis();
   }
   esp_task_wdt_reset();
   http.end();
+
+  String shaDownloaded;
+  if (written == (size_t)len) {
+    uint8_t d[32];
+    mbedtls_sha256_finish_ret(&dlSha, d);
+    shaDownloaded = probeHex(d, 32);
+  }
+  mbedtls_sha256_free(&dlSha);
 
   if (stalled || written != (size_t)len) {
     otaLastStatus = (stalled ? "stalled at " : "short read ") +
@@ -394,6 +417,24 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
 
       const esp_partition_t *run = esp_ota_get_running_partition();
       if (run) why += " running=" + String(run->label);
+    }
+
+    // Measure the read paths while the failure is still on the flash. The
+    // compact line goes to the fwlog so the mechanism is visible remotely;
+    // the full report stays readable on the status page and /verify.
+    {
+      const esp_partition_t *t = esp_ota_get_next_update_partition(nullptr);
+      FlashProbeResult pr = flashProbe(t, written);
+      otaLastProbe = flashProbeReport(pr, shaDownloaded);
+      why += " | probe dl=" + shaDownloaded.substring(0, 8) +
+             " raw=" + pr.shaRaw.substring(0, 8) +
+             " mmap=" + pr.shaMmap.substring(0, 8) +
+             " len=" + String(pr.imageLen) +
+             " diff=" + String(pr.diffChunks);
+      if (pr.diffChunks > 0)
+        why += " first=0x" + String(pr.firstDiff, HEX);
+      why += " imgv=" + String(esp_err_to_name(pr.imgVerify));
+      if (pr.note.length()) why += " note=" + pr.note;
     }
     otaLastStatus = "install failed: " + why;
     otaFailures++;
