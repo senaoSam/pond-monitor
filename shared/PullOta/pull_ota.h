@@ -251,23 +251,16 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
   if (clr != ESP_OK && clr != ESP_ERR_NOT_FOUND)
     otaLastStatus = "erase_last_boot: " + String(esp_err_to_name(clr));
 
-  const esp_partition_t *tgt = esp_ota_get_next_update_partition(nullptr);
-  if (tgt) {
-    // Erasing the whole slot is slower than letting Update.begin() do it, but
-    // it is what actually clears a stale header, and this runs at most once
-    // per update.
-    // In slices, feeding the watchdog between them: erasing 6.5MB takes long
-    // enough on its own to trip the 120s timer.
-    const size_t SLICE = 256 * 1024;
-    esp_err_t te = ESP_OK;
-    for (size_t off = 0; off < tgt->size && te == ESP_OK; off += SLICE) {
-      size_t n = tgt->size - off < SLICE ? tgt->size - off : SLICE;
-      te = esp_partition_erase_range(tgt, off, n);
-      esp_task_wdt_reset();
-    }
-    if (te != ESP_OK)
-      otaLastStatus = "erase target: " + String(esp_err_to_name(te));
-  }
+  // Deliberately NOT erasing the target slot here. That was added in v19 on
+  // the theory that a stale marking had to be cleared, and it is what broke
+  // the update path: v13 and v14 both installed cleanly before it existed, and
+  // every attempt after it failed with "Image hash failed - image is corrupt"
+  // -- even though a dump of the slot afterwards matched the release byte for
+  // byte, all 971408 of them. The data was never the problem. Update.begin()
+  // does its own erase and tracks what it has erased; erasing underneath it
+  // leaves the two disagreeing, and the image that results does not verify.
+  //
+  // Let Update own the slot.
 
   if (!Update.begin(len)) {
     otaLastStatus = "Update.begin: " + String(Update.errorString());

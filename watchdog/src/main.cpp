@@ -45,10 +45,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b27-2026.09.01";
+static const char *FW_VERSION = "b28-2026.09.01";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 27;
+static const uint32_t FW_VERSION_CODE = 28;
 
 static const uint32_t CHECK_INTERVAL_MS = 60UL * 1000;
 
