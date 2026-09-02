@@ -19,10 +19,15 @@
 // updated remotely. A hardware watchdog now reboots it if the main loop stalls
 // past WDT_TIMEOUT_S -- a watchdog that cannot recover itself is not one.
 //
-// Sending the Discord message is deliberately NOT done here: the requirement
-// is to keep re-notifying until acknowledged from a phone, and an ESP32 cannot
-// receive Discord interactions. A Node.js bot owns that loop and clears
-// /alerts/<id>/acked; this device only reports facts.
+// Discord is spoken to directly from this device -- both the alert and the
+// acknowledgement. Re-notifying until someone acknowledges would normally want
+// a server to receive Discord interactions, which an ESP32 cannot do; the way
+// round it is to poll the reactions on our own message instead of being pushed
+// them, so no always-on host is needed.
+//
+// It also configures its own WiFi over HTTP, because the boards get moved
+// between sites whose networks are not known in advance and nobody on site can
+// be asked to operate a tool. See the wifi section for the order and why.
 
 #include <ArduinoOTA.h>
 #include <Arduino.h>
@@ -33,6 +38,7 @@
 #include <rom/rtc.h>
 #include <esp_task_wdt.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -46,10 +52,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b38-2026.09.01";
+static const char *FW_VERSION = "b39-2026.09.02";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 38;
+static const uint32_t FW_VERSION_CODE = 39;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -95,6 +101,14 @@ static const uint32_t STALE_MULTIPLE = 5;
 // Used when a node's meta.interval is missing, so a malformed node still gets
 // a sane threshold rather than being treated as permanently fine.
 static const uint32_t DEFAULT_INTERVAL_S = 60;
+
+// Full passes over the candidate networks before giving up and rebooting.
+// Each pass is a 12s timeout per configured network plus the blink between
+// them, so four passes is roughly three to five minutes -- long enough for
+// someone to notice the purple LED, reach for a phone and switch the hotspot
+// on, and short enough that a firmware that genuinely cannot connect still
+// reaches the reboot that lets pull_ota roll it back.
+static const uint32_t WIFI_BOOT_ATTEMPTS = 4;
 
 // ---- state ------------------------------------------------------------
 static WebServer server(80);
@@ -170,6 +184,31 @@ static void blinkColor(StatusColor c, int times, int onMs) {
 }
 
 // ---- wifi -------------------------------------------------------------
+//
+// The board has to survive being moved to a pond whose network nobody here
+// knows in advance, and the person on site cannot be asked to operate
+// anything. So credentials live in NVS rather than in the build, and there are
+// two ways to change them without a reflash and without being on site:
+//
+//   /wifi    sets the target network. Served as a form, so the person on site
+//            fills in their own network's name and password -- they know it,
+//            we do not.
+//   /rescue  sets the rescue hotspot itself, for swapping to a different
+//            phone later.
+//
+// Connection order at boot, first success wins:
+//
+//   1. NVS target        what /wifi last stored; the normal case
+//   2. NVS target_prev   the target before that, so a mistyped SSID undoes
+//                        itself instead of stranding the board
+//   3. NVS rescue        the hand-opened phone hotspot
+//   4. WIFI_NETWORKS     factory defaults from secrets.h, the final safety net
+//
+// The rescue hotspot is deliberately last of the reachable options rather than
+// first. It is normally switched off, so trying it early would cost a 12s
+// timeout on every single boot for a network that is not there -- and if it
+// ever were left on, the board would leave a perfectly good target network to
+// sit on someone's mobile data.
 struct WiFiNetwork {
   const char *ssid;
   const char *pass;
@@ -177,18 +216,190 @@ struct WiFiNetwork {
 static const WiFiNetwork NETWORKS[] = WIFI_NETWORKS;
 static const char *connectedSsid = "none";
 
-static bool connectWiFi() {
-  for (const WiFiNetwork &n : NETWORKS) {
-    WiFi.begin(n.ssid, n.pass);
-    uint32_t deadline = millis() + 12000;
-    while (WiFi.status() != WL_CONNECTED && millis() < deadline)
-      blinkColor(BLUE, 1, 250);
+// Set when the network we ended up on is the rescue hotspot, which is what
+// makes the board announce itself on Discord and what the status page reports.
+static bool onRescueNetwork = false;
 
-    if (WiFi.status() == WL_CONNECTED) {
-      connectedSsid = n.ssid;
+// How long to wait for one network before moving on. Twelve seconds is what
+// this board has always used and is enough for a slow DHCP.
+static const uint32_t WIFI_ATTEMPT_MS = 12000;
+
+// ---- credential storage ------------------------------------------------
+//
+// Namespace "wifi", separate from pull_ota's "fw", so erasing one cannot
+// disturb the other.
+//
+//   ssid/pass            current target
+//   pssid/ppass          previous target, kept for the automatic revert
+//   rssid/rpass          rescue hotspot
+//   pending              1 while a freshly-set target has not yet proven it
+//                        can connect
+static Preferences wifiPrefs;
+
+struct Credentials {
+  String ssid;
+  String pass;
+};
+
+static Credentials nvsRead(const char *ssidKey, const char *passKey) {
+  Credentials c;
+  wifiPrefs.begin("wifi", true);
+  c.ssid = wifiPrefs.getString(ssidKey, "");
+  c.pass = wifiPrefs.getString(passKey, "");
+  wifiPrefs.end();
+  return c;
+}
+
+static Credentials storedTarget() { return nvsRead("ssid", "pass"); }
+static Credentials storedPrevious() { return nvsRead("pssid", "ppass"); }
+
+// The rescue hotspot falls back to the compiled-in default until /rescue has
+// been used, so a board that has never been configured is still rescuable.
+static Credentials storedRescue() {
+  Credentials c = nvsRead("rssid", "rpass");
+  if (!c.ssid.length()) {
+    c.ssid = RESCUE_SSID;
+    c.pass = RESCUE_PASS;
+  }
+  return c;
+}
+
+static bool targetPending() {
+  wifiPrefs.begin("wifi", true);
+  bool p = wifiPrefs.getBool("pending", false);
+  wifiPrefs.end();
+  return p;
+}
+
+static void clearPending() {
+  wifiPrefs.begin("wifi", false);
+  wifiPrefs.remove("pending");
+  wifiPrefs.end();
+}
+
+// Stores a new target and marks it unproven. The outgoing target becomes the
+// previous one -- that is the whole revert mechanism, so it must not be
+// skipped even when the two are identical.
+static void storeTarget(const String &ssid, const String &pass) {
+  Credentials old = storedTarget();
+  wifiPrefs.begin("wifi", false);
+  if (old.ssid.length()) {
+    wifiPrefs.putString("pssid", old.ssid);
+    wifiPrefs.putString("ppass", old.pass);
+  }
+  wifiPrefs.putString("ssid", ssid);
+  wifiPrefs.putString("pass", pass);
+  wifiPrefs.putBool("pending", true);
+  wifiPrefs.end();
+}
+
+static void storeRescue(const String &ssid, const String &pass) {
+  wifiPrefs.begin("wifi", false);
+  wifiPrefs.putString("rssid", ssid);
+  wifiPrefs.putString("rpass", pass);
+  wifiPrefs.end();
+}
+
+// Promotes the previous target back to current. Called when a pending target
+// failed to connect, so the board returns to the network it was last happy on
+// instead of waiting for someone to notice.
+static void revertTarget() {
+  Credentials prev = storedPrevious();
+  if (!prev.ssid.length()) return;
+  wifiPrefs.begin("wifi", false);
+  wifiPrefs.putString("ssid", prev.ssid);
+  wifiPrefs.putString("pass", prev.pass);
+  wifiPrefs.remove("pssid");
+  wifiPrefs.remove("ppass");
+  wifiPrefs.remove("pending");
+  wifiPrefs.end();
+}
+
+// ---- connecting ---------------------------------------------------------
+
+// What this boot tried and how it went, so the status page and the Discord
+// announcement can explain the situation without re-deriving it. RAM only.
+static String wifiAttemptedSsid = "";
+static bool wifiReverted = false;
+// True only on the boot where a target that was still unproven connected for
+// the first time -- the one boot worth announcing as a success.
+static bool wifiJustConfirmed = false;
+
+static bool tryNetwork(const String &ssid, const String &pass) {
+  if (!ssid.length()) return false;
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  uint32_t deadline = millis() + WIFI_ATTEMPT_MS;
+  while (WiFi.status() != WL_CONNECTED && millis() < deadline)
+    blinkColor(BLUE, 1, 250);
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.disconnect();
+  return false;
+}
+
+// connectedSsid points into this, so the winning name outlives the call.
+static String connectedSsidStore;
+
+static bool connectWiFi() {
+  onRescueNetwork = false;
+
+  Credentials target = storedTarget();
+  bool pending = targetPending();
+  wifiAttemptedSsid = target.ssid;
+
+  // 1. the stored target
+  if (tryNetwork(target.ssid, target.pass)) {
+    connectedSsidStore = target.ssid;
+    connectedSsid = connectedSsidStore.c_str();
+    if (pending) {
+      clearPending();  // it works; stop calling it unproven
+      wifiJustConfirmed = true;
+    }
+    return true;
+  }
+
+  // 2. the target before it. Only meaningful while the current one is still
+  //    unproven -- once a target has connected at least once, a later failure
+  //    is the network being down, not a bad credential, and silently moving
+  //    back to an older network would hide that.
+  if (pending) {
+    Credentials prev = storedPrevious();
+    if (tryNetwork(prev.ssid, prev.pass)) {
+      revertTarget();
+      wifiReverted = true;
+      connectedSsidStore = prev.ssid;
+      connectedSsid = connectedSsidStore.c_str();
       return true;
     }
-    WiFi.disconnect();
+  }
+
+  // 3. the rescue hotspot
+  Credentials rescue = storedRescue();
+  if (tryNetwork(rescue.ssid, rescue.pass)) {
+    onRescueNetwork = true;
+    // The pending target failed and nothing older worked either. Drop the
+    // pending mark so the next boot does not re-run this same dance, but keep
+    // whatever is stored: the form shows it, and it is the only record of what
+    // was attempted.
+    if (pending) {
+      clearPending();
+      wifiReverted = true;
+    }
+    connectedSsidStore = rescue.ssid;
+    connectedSsid = connectedSsidStore.c_str();
+    return true;
+  }
+
+  // 4. factory defaults
+  for (const WiFiNetwork &n : NETWORKS) {
+    if (tryNetwork(n.ssid, n.pass)) {
+      if (pending) {
+        revertTarget();
+        wifiReverted = true;
+      }
+      connectedSsidStore = n.ssid;
+      connectedSsid = connectedSsidStore.c_str();
+      return true;
+    }
   }
   return false;
 }
@@ -415,8 +626,8 @@ static bool writeAlert(const String &id, bool active, time_t lastSeen,
   body += ",\"by\":\"" + String(DEVICE_ID) + "\"";
   if (active) {
     body += ",\"firedAt\":" + String((uint32_t)now);
-    // The bot owns `acked`; clearing it here is what starts a fresh
-    // notification loop for a newly-fired alert.
+    // Cleared on every fresh alert: driveNotifications() sets it back once it
+    // sees the reaction, so a new alert has to start from unacknowledged.
     body += ",\"acked\":false";
   } else {
     body += ",\"clearedAt\":" + String((uint32_t)now);
@@ -700,10 +911,301 @@ static const char *resetReasonName() {
   }
 }
 
+// ---- wifi configuration over http --------------------------------------
+//
+// Two ways in, one handler each. Both accept the credentials as query
+// parameters and both serve a form when called without them, because the two
+// callers are completely different people:
+//
+//   the operator  types a URL, or scripts it, and knows the OTA password
+//   the person
+//   on site       taps a link out of Discord and fills in two boxes
+//
+// The form is what makes the second case possible at all. The new network's
+// name and password are known on site and nowhere else, so asking for them
+// there is not a fallback -- it is the only place the answer exists.
+
+// Percent-decoding is done by WebServer::arg(), so the values arrive usable.
+// What still has to be escaped is the way back out: into HTML for the form,
+// and into JSON for Discord.
+static String htmlEscape(const String &in) {
+  String o;
+  o.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '&': o += "&amp;"; break;
+      case '<': o += "&lt;"; break;
+      case '>': o += "&gt;"; break;
+      case '"': o += "&quot;"; break;
+      default: o += c;
+    }
+  }
+  return o;
+}
+
+// Discord bodies here are hand-built JSON, and the Chinese in them is written
+// as \uXXXX escapes -- so the message templates are already JSON source and
+// must be passed through untouched. Only the values interpolated into them are
+// data: an SSID is chosen by whoever owns the network and can perfectly well
+// contain a quote or a backslash, either of which would end the string early
+// and produce a body Discord rejects.
+//
+// Hence this is applied to the values, by the caller, and never to the
+// template. Escaping the whole message would replace every backslash in every
+// \u escape and the text would arrive as literal "u5931u6557".
+static String jsonEscape(const String &in) {
+  String o;
+  o.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '"' || c == '\\' || c == '\n' || c == '\r')
+      o += ' ';
+    else
+      o += c;
+  }
+  return o;
+}
+
+// Posts a one-shot message, mentioning the owner so the phone actually pushes
+// it. Separate from discordNotify(): that one drives the alert loop, with a
+// reaction to collect and a re-notify schedule. These are statements of fact
+// with nothing to acknowledge.
+//
+// `content` is JSON string source, not plain text: callers build it with
+// \uXXXX escapes and run jsonEscape() over anything interpolated.
+static bool discordSay(const String &content) {
+  String body = "{\"content\":\"<@" + String(DISCORD_USER_ID) + "> " +
+                content + "\"}";
+  return discordRequest("POST",
+                        "/channels/" + String(DISCORD_CHANNEL_ID) + "/messages",
+                        body, nullptr);
+}
+
+// Announces the outcome of the last boot's WiFi decision. Called once, after
+// the network and the clock are up.
+//
+// The rescue case is the one that matters: the board is reachable only for as
+// long as someone holds a hotspot open, so the message carries the URL of the
+// form rather than describing where to find it. Tapping it in Discord is the
+// entire procedure.
+static void announceWiFiState() {
+  String ip = WiFi.localIP().toString();
+
+  if (onRescueNetwork) {
+    // 連不上目標網路，已連上救援熱點
+    String m = "\\u26a0\\ufe0f **";
+    m += String(DEVICE_ID) + " \\u9023\\u4e0d\\u4e0a\\u76ee\\u6a19\\u7db2\\u8def**\\n";
+    if (wifiAttemptedSsid.length())
+      m += "\\u5617\\u8a66\\u9023\\u7dda\\uff1a" + jsonEscape(wifiAttemptedSsid) +
+           "\\uff08\\u5931\\u6557\\uff09\\n";
+    m += "\\u76ee\\u524d\\u5728\\u6551\\u63f4\\u71b1\\u9ede\\uff1a" +
+         jsonEscape(String(connectedSsid)) + "\\n\\n";
+    m += "\\u8acb\\u9ede\\u4e0b\\u9762\\u9023\\u7d50\\u8a2d\\u5b9a\\u65b0\\u7684 WiFi\\uff1a\\n";
+    m += "http://" + ip + "/wifi";
+    discordSay(m);
+    return;
+  }
+
+  if (wifiReverted) {
+    // 新設定連不上，已自動退回
+    String m = "\\u26a0\\ufe0f **" + String(DEVICE_ID) + " WiFi \\u8a2d\\u5b9a\\u5931\\u6557**\\n";
+    if (wifiAttemptedSsid.length())
+      m += "\\u9023\\u4e0d\\u4e0a\\uff1a" + jsonEscape(wifiAttemptedSsid) + "\\n";
+    m += "\\u5df2\\u81ea\\u52d5\\u9000\\u56de\\uff1a" +
+         jsonEscape(String(connectedSsid)) + "\\n";
+    m += "IP\\uff1a" + ip;
+    discordSay(m);
+    return;
+  }
+
+  // A normal boot says nothing. The board reports for duty every minute
+  // already; an extra message per reboot would only train the owner to ignore
+  // this channel. Only a *newly confirmed* target is worth one.
+  if (wifiJustConfirmed) {
+    // WiFi 已更新
+    String m = "\\u2705 **" + String(DEVICE_ID) + " WiFi \\u5df2\\u66f4\\u65b0**\\n";
+    m += "\\u5df2\\u9023\\u4e0a\\uff1a" + jsonEscape(String(connectedSsid)) + "\\n";
+    m += "IP\\uff1a" + ip;
+    discordSay(m);
+  }
+}
+
+// The form. Deliberately one self-contained string with no external CSS, no
+// JavaScript and no favicon request: it is served to a phone over a hotspot
+// with no internet route, so anything it cannot fetch locally would simply
+// hang. utf-8 and the viewport line are both load-bearing -- without them the
+// Chinese renders as boxes and the inputs come out too small to tap.
+static String configFormPage(const char *action, const char *heading,
+                             const String &currentSsid,
+                             const String &statusLine) {
+  String h = F("<!doctype html><html><head><meta charset=\"utf-8\">"
+               "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+               "<title>ESP32 WiFi</title><style>"
+               "body{font-family:system-ui,sans-serif;margin:0;padding:24px;"
+               "background:#f4f4f6;color:#111}"
+               ".c{max-width:420px;margin:0 auto;background:#fff;padding:24px;"
+               "border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,.12)}"
+               "h2{margin:0 0 16px;font-size:22px}"
+               ".s{background:#f0f0f4;padding:12px;border-radius:8px;"
+               "font-size:15px;line-height:1.7;margin-bottom:20px;color:#444}"
+               "label{display:block;margin:14px 0 6px;font-size:16px}"
+               "input{width:100%;box-sizing:border-box;padding:13px;"
+               "font-size:17px;border:1px solid #ccc;border-radius:8px}"
+               "button{width:100%;margin-top:22px;padding:16px;font-size:18px;"
+               "border:0;border-radius:8px;background:#2563eb;color:#fff}"
+               "</style></head><body><div class=\"c\">");
+  h += "<h2>";
+  h += heading;
+  h += "</h2>";
+  h += "<div class=\"s\">" + statusLine + "</div>";
+  h += "<form method=\"get\" action=\"";
+  h += action;
+  h += "\">";
+  // The password rides along hidden so the person on site never sees it and
+  // never has to be told it.
+  h += "<input type=\"hidden\" name=\"pass\" value=\"" +
+       htmlEscape(String(OTA_PASSWORD)) + "\">";
+  // 網路名稱 (SSID)
+  h += F("<label>網路名稱 (SSID)</label>");
+  h += "<input name=\"ssid\" value=\"" + htmlEscape(currentSsid) +
+       "\" autocapitalize=\"off\" autocorrect=\"off\" spellcheck=\"false\">";
+  // 密碼
+  h += F("<label>密碼</label>");
+  h += F("<input name=\"wpass\" autocapitalize=\"off\" autocorrect=\"off\" "
+         "spellcheck=\"false\">");
+  // 儲存並重新啟動
+  h += F("<button>儲存並重新啟動</button>");
+  h += F("</form></div></body></html>");
+  return h;
+}
+
+// Shown after a successful save. The board reboots a moment later, so this
+// page has to say what to expect without being able to report it: the LED is
+// the only signal available to someone standing next to it.
+static String savedPage(const String &ssid) {
+  String h = F("<!doctype html><html><head><meta charset=\"utf-8\">"
+               "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+               "<title>ESP32 WiFi</title><style>"
+               "body{font-family:system-ui,sans-serif;margin:0;padding:24px;"
+               "background:#f4f4f6;color:#111}"
+               ".c{max-width:420px;margin:0 auto;background:#fff;padding:24px;"
+               "border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,.12)}"
+               "h2{margin:0 0 14px;font-size:22px}"
+               "p{font-size:16px;line-height:1.8;margin:10px 0}"
+               "</style></head><body><div class=\"c\">");
+  // 已儲存
+  h += F("<h2>✅ 已儲存</h2>");
+  h += "<p>";
+  // 設定為：
+  h += F("設定為：");
+  h += "<b>" + htmlEscape(ssid) + "</b></p>";
+  // 板子正在重新啟動，約 30 秒。
+  h += F("<p>板子正在重新啟動，約 30 秒。</p>");
+  // 如果紫燈停止閃爍，代表連線成功。
+  h += F("<p>如果紫燈停止閃爍，"
+         "代表連線成功。</p>");
+  // 如果紫燈繼續閃，請保持熱點開啟並回報。
+  h += F("<p>如果紫燈繼續閃，"
+         "請保持熱點開啟並回報。</p>");
+  h += F("</div></body></html>");
+  return h;
+}
+
+// Shared by both handlers: the OTA password gates the write, so a stray
+// request on the pond's own LAN cannot reconfigure the board out from under
+// itself. Not a secrecy measure -- it is there to stop an accident.
+static bool configAuthorised() {
+  return server.arg("pass") == OTA_PASSWORD;
+}
+
+static void handleWifiConfig() {
+  if (!configAuthorised()) {
+    server.send(403, "text/plain; charset=utf-8", "bad pass");
+    return;
+  }
+
+  String ssid = server.arg("ssid");
+  if (!ssid.length()) {
+    Credentials cur = storedTarget();
+    String status;
+    if (onRescueNetwork) {
+      // 目前在救援熱點，請填入現場的 WiFi。
+      status = F("目前在救援熱點，"
+                 "請填入現場的 WiFi。");
+      if (wifiAttemptedSsid.length()) {
+        // 上次嘗試：
+        status += F("<br>上次嘗試：");
+        status += htmlEscape(wifiAttemptedSsid);
+        // （失敗）
+        status += F("（失敗）");
+      }
+    } else {
+      // 目前連線：
+      status = F("目前連線：");
+      status += htmlEscape(String(connectedSsid));
+    }
+    // 設定目標 WiFi
+    server.send(200, "text/html; charset=utf-8",
+                configFormPage("/wifi",
+                               "設定目標 WiFi", cur.ssid,
+                               status));
+    return;
+  }
+
+  storeTarget(ssid, server.arg("wpass"));
+  logLine("wifi target set to %s, rebooting", ssid.c_str());
+  server.send(200, "text/html; charset=utf-8", savedPage(ssid));
+  // Let the response actually leave before the reset tears the socket down.
+  delay(1200);
+  ESP.restart();
+}
+
+static void handleRescueConfig() {
+  if (!configAuthorised()) {
+    server.send(403, "text/plain; charset=utf-8", "bad pass");
+    return;
+  }
+
+  String ssid = server.arg("ssid");
+  if (!ssid.length()) {
+    Credentials cur = storedRescue();
+    // 只有在目標網路連不上時才會用到這組。
+    String status = F("只有在目標網路"
+                      "連不上時才會用到"
+                      "這組。");
+    // 設定救援熱點
+    server.send(200, "text/html; charset=utf-8",
+                configFormPage("/rescue",
+                               "設定救援熱點", cur.ssid,
+                               status));
+    return;
+  }
+
+  storeRescue(ssid, server.arg("wpass"));
+  logLine("rescue hotspot set to %s", ssid.c_str());
+  // No reboot: the rescue credentials are not in use right now, and rebooting
+  // to apply them would drop the very connection being used to set them.
+  server.send(200, "text/html; charset=utf-8", savedPage(ssid));
+}
+
 // ---- http status page -------------------------------------------------
 static void handleRoot() {
   String b = "=== ESP32-B watchdog ===\n";
-  b += "ssid: " + String(connectedSsid) + "\n";
+  b += "ssid: " + String(connectedSsid);
+  if (onRescueNetwork) b += "  [RESCUE HOTSPOT]";
+  b += "\n";
+  {
+    Credentials t = storedTarget();
+    b += "target: " + (t.ssid.length() ? t.ssid : String("(none, using defaults)"));
+    if (targetPending()) b += "  [unproven]";
+    b += "\n";
+    Credentials pv = storedPrevious();
+    if (pv.ssid.length()) b += "target prev: " + pv.ssid + "\n";
+    b += "rescue: " + storedRescue().ssid + "\n";
+    if (wifiReverted)
+      b += "note: " + wifiAttemptedSsid + " failed, reverted this boot\n";
+  }
   b += "ip: " + WiFi.localIP().toString() + "\n";
   b += "rssi: " + String(WiFi.RSSI()) + " dBm\n";
   b += "uptime: " + String(millis() / 1000) + "s\n";
@@ -940,10 +1442,30 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  if (!connectWiFi()) {
-    setLed(PURPLE);
-    delay(5000);
-    ESP.restart();
+
+  // Keep retrying rather than rebooting straight away. The rescue hotspot is
+  // switched on by hand after someone notices the LED, which cannot be
+  // synchronised with a boot -- so the board has to still be looking when the
+  // hotspot finally appears. Purple keeps blinking throughout: that is the
+  // signal the person on site is told to watch for.
+  //
+  // Bounded, though, and this is the part that must not be removed. An image
+  // that cannot reach WiFi is exactly what pull_ota's rollback exists to undo,
+  // and rollback only happens on a reboot. Looping here forever would trap a
+  // broken update in the one state it was designed to escape. So: give the
+  // hotspot a realistic window, then reboot and let the safety net work.
+  uint32_t wifiTries = 0;
+  while (!connectWiFi()) {
+    if (++wifiTries >= WIFI_BOOT_ATTEMPTS) {
+      logLine("no wifi after %lu attempts, rebooting",
+              (unsigned long)wifiTries);
+      setLed(PURPLE);
+      delay(2000);
+      ESP.restart();
+    }
+    // Slow purple blink between passes, distinct from the fast blue of an
+    // attempt in progress.
+    for (int i = 0; i < 5; i++) blinkColor(PURPLE, 1, 500);
   }
   blinkColor(GREEN, 5, 60);
 
@@ -956,9 +1478,10 @@ void setup() {
   uint32_t ntpDeadline = millis() + 15000;
   while (time(nullptr) < 1600000000 && millis() < ntpDeadline) delay(200);
 
-  logLine("boot ok ip=%s ssid=%s time=%s",
+  logLine("boot ok ip=%s ssid=%s time=%s%s",
           WiFi.localIP().toString().c_str(), connectedSsid,
-          time(nullptr) > 1600000000 ? "synced" : "NOT SYNCED");
+          time(nullptr) > 1600000000 ? "synced" : "NOT SYNCED",
+          onRescueNetwork ? " [RESCUE]" : "");
   otaPullBegin(RTDB_HOST, DEVICE_ID, FW_VERSION_CODE);
   logLine("fw v%lu, pull-ota: %s", (unsigned long)FW_VERSION_CODE,
           otaPullStatus().c_str());
@@ -974,6 +1497,10 @@ void setup() {
   } else {
     logLine("discord /users/@me FAILED: %s", lastError.c_str());
   }
+
+  // Report what happened to WiFi at boot. After the bot id is known, because
+  // that call is the proof Discord is usable at all.
+  announceWiFiState();
 
   ArduinoOTA.setHostname(DEVICE_ID);
   ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -998,6 +1525,8 @@ void setup() {
   ArduinoOTA.begin();
 
   server.on("/", handleRoot);
+  server.on("/wifi", handleWifiConfig);
+  server.on("/rescue", handleRescueConfig);
   server.on("/check", handleCheckNow);
   server.on("/testalert", handleTestAlert);
   server.on("/testack", handleTestAck);
