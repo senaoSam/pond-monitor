@@ -52,10 +52,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b41-2026.09.03";
+static const char *FW_VERSION = "b42-2026.09.03";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 41;
+static const uint32_t FW_VERSION_CODE = 42;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -310,8 +310,17 @@ static void storeRescue(const String &ssid, const String &pass) {
 // instead of waiting for someone to notice.
 static void revertTarget() {
   Credentials prev = storedPrevious();
-  if (!prev.ssid.length()) return;
   wifiPrefs.begin("wifi", false);
+  // Clear the marker whether or not there is somewhere to revert to. It only
+  // means "this target has not proved itself yet", and it has now had its
+  // chance -- leaving it set made the board re-run the same failing sequence
+  // on every boot, forever, with the status page permanently reading
+  // [unproven].
+  wifiPrefs.remove("pending");
+  if (!prev.ssid.length()) {
+    wifiPrefs.end();
+    return;
+  }
   wifiPrefs.putString("ssid", prev.ssid);
   wifiPrefs.putString("pass", prev.pass);
   wifiPrefs.remove("pssid");
@@ -1106,6 +1115,14 @@ static bool discordSay(const String &content) {
 // entire procedure.
 static void announceWiFiState() {
   String ip = WiFi.localIP().toString();
+
+  // Says which branch below was taken, and why. Two broken releases in a row
+  // came down to guessing at these flags from the outside; the board knows.
+  logLine("wifi state: knownSite=%d rescue=%d reverted=%d confirmed=%d "
+          "attempted=%s on=%s",
+          onKnownSite, onRescueNetwork, wifiReverted, wifiJustConfirmed,
+          wifiAttemptedSsid.length() ? wifiAttemptedSsid.c_str() : "(none)",
+          connectedSsid);
 
   // Landing anywhere other than the configured target is worth saying out
   // loud, whichever network it turned out to be. Either somebody moved the
