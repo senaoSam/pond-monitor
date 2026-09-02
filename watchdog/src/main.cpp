@@ -329,6 +329,9 @@ static bool wifiReverted = false;
 // True only on the boot where a target that was still unproven connected for
 // the first time -- the one boot worth announcing as a success.
 static bool wifiJustConfirmed = false;
+// True when the target was unreachable and one of the known sites answered
+// instead: the board has been moved, or the pond network is down.
+static bool onKnownSite = false;
 
 static bool tryNetwork(const String &ssid, const String &pass) {
   if (!ssid.length()) return false;
@@ -346,6 +349,7 @@ static String connectedSsidStore;
 
 static bool connectWiFi() {
   onRescueNetwork = false;
+  onKnownSite = false;
 
   Credentials target = storedTarget();
   bool pending = targetPending();
@@ -387,6 +391,9 @@ static bool connectWiFi() {
         revertTarget();
         wifiReverted = true;
       }
+      // Only unexpected if a target was configured at all. A board that has
+      // never been given one is supposed to be here.
+      onKnownSite = target.ssid.length() > 0;
       connectedSsidStore = n.ssid;
       connectedSsid = connectedSsidStore.c_str();
       return true;
@@ -416,6 +423,30 @@ static bool connectWiFi() {
 }
 
 // ---- rtdb -------------------------------------------------------------
+
+// Discord bodies here are hand-built JSON, and the Chinese in them is written
+// as \uXXXX escapes -- so the message templates are already JSON source and
+// must be passed through untouched. Only the values interpolated into them are
+// data: an SSID is chosen by whoever owns the network and can perfectly well
+// contain a quote or a backslash, either of which would end the string early
+// and produce a body Discord rejects.
+//
+// Hence this is applied to the values, by the caller, and never to the
+// template. Escaping the whole message would replace every backslash in every
+// \u escape and the text would arrive as literal "u5931u6557".
+static String jsonEscape(const String &in) {
+  String o;
+  o.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '"' || c == '\\' || c == '\n' || c == '\r')
+      o += ' ';
+    else
+      o += c;
+  }
+  return o;
+}
+
 static bool rtdbRequest(const char *method, const String &path,
                         const String &body, String *out) {
   WiFiClientSecure client;
@@ -873,6 +904,12 @@ static bool publishSelf() {
   body += "\"ts\":" + String((uint32_t)now);
   body += ",\"checks\":" + String(checksRun);
   body += ",\"alerting\":" + String(anyAlertActive ? "true" : "false");
+  // Where the board actually is. Both are needed from 300km away: the SSID
+  // says whether it is still at the pond or has been carried somewhere, and
+  // the IP is the only way to reach its config page, which is on a private
+  // network that cannot be scanned from here.
+  body += ",\"ssid\":\"" + jsonEscape(String(connectedSsid)) + "\"";
+  body += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
   body += "}";
   body += "}";
   return rtdbRequest("PATCH", "/.json", body, nullptr);
@@ -955,39 +992,20 @@ static String htmlEscape(const String &in) {
   return o;
 }
 
-// Discord bodies here are hand-built JSON, and the Chinese in them is written
-// as \uXXXX escapes -- so the message templates are already JSON source and
-// must be passed through untouched. Only the values interpolated into them are
-// data: an SSID is chosen by whoever owns the network and can perfectly well
-// contain a quote or a backslash, either of which would end the string early
-// and produce a body Discord rejects.
+// Posts a one-shot message. Deliberately mentions nobody: a mention is what
+// makes a phone buzz, and these messages report where the board ended up, not
+// that something needs doing. The board only lands on an unexpected network
+// because a person carried it somewhere and plugged it in -- they are already
+// looking for it, so buzzing them adds nothing, and buzzing everyone for every
+// reboot is how a channel gets muted.
 //
-// Hence this is applied to the values, by the caller, and never to the
-// template. Escaping the whole message would replace every backslash in every
-// \u escape and the text would arrive as literal "u5931u6557".
-static String jsonEscape(const String &in) {
-  String o;
-  o.reserve(in.length() + 8);
-  for (size_t i = 0; i < in.length(); i++) {
-    char c = in[i];
-    if (c == '"' || c == '\\' || c == '\n' || c == '\r')
-      o += ' ';
-    else
-      o += c;
-  }
-  return o;
-}
-
-// Posts a one-shot message, mentioning the owner so the phone actually pushes
-// it. Separate from discordNotify(): that one drives the alert loop, with a
-// reaction to collect and a re-notify schedule. These are statements of fact
-// with nothing to acknowledge.
+// The alert path is the opposite case and keeps its mention: nobody is
+// watching when a pond node goes quiet at 3am. See discordNotify().
 //
 // `content` is JSON string source, not plain text: callers build it with
 // \uXXXX escapes and run jsonEscape() over anything interpolated.
 static bool discordSay(const String &content) {
-  String body = "{\"content\":\"<@" + String(DISCORD_USER_ID) + "> " +
-                content + "\"}";
+  String body = "{\"content\":\"" + content + "\"}";
   return discordRequest("POST",
                         "/channels/" + String(DISCORD_CHANNEL_ID) + "/messages",
                         body, nullptr);
@@ -1002,6 +1020,26 @@ static bool discordSay(const String &content) {
 // entire procedure.
 static void announceWiFiState() {
   String ip = WiFi.localIP().toString();
+
+  // Landing anywhere other than the configured target is worth saying out
+  // loud, whichever network it turned out to be. Either somebody moved the
+  // board -- which is the recovery plan working, and they are waiting for this
+  // message to tell them where it went -- or the pond network is down, which
+  // needs to be known. Both carry the setup URL, because whoever reads this is
+  // the person who can act on it, and tapping the link is the whole procedure.
+  if (onKnownSite) {
+    String m = "\u2139\ufe0f **" + String(DEVICE_ID) +
+               " \u4e0d\u5728\u76ee\u6a19\u7db2\u8def\u4e0a**\n";
+    if (wifiAttemptedSsid.length())
+      m += "\u76ee\u6a19\uff1a" + jsonEscape(wifiAttemptedSsid) +
+           "\uff08\u9023\u4e0d\u4e0a\uff09\n";
+    m += "\u76ee\u524d\u9023\u4e0a\uff1a" +
+         jsonEscape(String(connectedSsid)) + "\n\n";
+    m += "\u8981\u6539\u76ee\u6a19 WiFi \u8acb\u9ede\uff1a\n";
+    m += "http://" + ip + "/wifi";
+    discordSay(m);
+    return;
+  }
 
   if (onRescueNetwork) {
     // 連不上目標網路，已連上救援熱點
