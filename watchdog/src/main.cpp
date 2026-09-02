@@ -52,10 +52,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b40-2026.09.03";
+static const char *FW_VERSION = "b41-2026.09.03";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 40;
+static const uint32_t FW_VERSION_CODE = 41;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -847,11 +847,11 @@ static void announceNodeMove(const String &id, const String &obj,
 
   // 節點換了網路
   String m = "\\u2139\\ufe0f **" + jsonEscape(id) +
-             " \\u63db\\u4e86\\u7db2\\u8def**\n";
-  m += "\\u539f\\u672c\\uff1a" + jsonEscape(from) + "\n";
-  m += "\\u73fe\\u5728\\uff1a" + jsonEscape(ssid) + "\n";
+             " \\u63db\\u4e86\\u7db2\\u8def**\\n";
+  m += "\\u539f\\u672c\\uff1a" + jsonEscape(from) + "\\n";
+  m += "\\u73fe\\u5728\\uff1a" + jsonEscape(ssid) + "\\n";
   if (ip.length()) {
-    m += "\n\\u8981\\u6539\\u5b83\\u7684 WiFi \\u8acb\\u9ede\\uff1a\n";
+    m += "\\n\\u8981\\u6539\\u5b83\\u7684 WiFi \\u8acb\\u9ede\\uff1a\\n";
     m += "http://" + jsonEscape(ip) + "/wifi";
   }
   if (discordSay(m))
@@ -1085,9 +1085,16 @@ static String htmlEscape(const String &in) {
 // \uXXXX escapes and run jsonEscape() over anything interpolated.
 static bool discordSay(const String &content) {
   String body = "{\"content\":\"" + content + "\"}";
-  return discordRequest("POST",
-                        "/channels/" + String(DISCORD_CHANNEL_ID) + "/messages",
-                        body, nullptr);
+  bool ok = discordRequest("POST",
+                           "/channels/" + String(DISCORD_CHANNEL_ID) +
+                               "/messages",
+                           body, nullptr);
+  // Logged here rather than left to the callers. Every one of them treats this
+  // as fire-and-forget, so a rejected body -- a stray newline or a single
+  // backslash in the hand-built JSON -- looked identical to the message simply
+  // not being due. Two of them shipped broken that way.
+  if (!ok) logLine("discordSay FAILED: %s", lastError.c_str());
+  return ok;
 }
 
 // Announces the outcome of the last boot's WiFi decision. Called once, after
@@ -1108,13 +1115,13 @@ static void announceWiFiState() {
   // the person who can act on it, and tapping the link is the whole procedure.
   if (onKnownSite) {
     String m = "\\u2139\\ufe0f **" + String(DEVICE_ID) +
-               " \\u4e0d\\u5728\\u76ee\\u6a19\\u7db2\\u8def\\u4e0a**\n";
+               " \\u4e0d\\u5728\\u76ee\\u6a19\\u7db2\\u8def\\u4e0a**\\n";
     if (wifiAttemptedSsid.length())
       m += "\\u76ee\\u6a19\\uff1a" + jsonEscape(wifiAttemptedSsid) +
-           "\\uff08\\u9023\\u4e0d\\u4e0a\\uff09\n";
+           "\\uff08\\u9023\\u4e0d\\u4e0a\\uff09\\n";
     m += "\\u76ee\\u524d\\u9023\\u4e0a\\uff1a" +
-         jsonEscape(String(connectedSsid)) + "\n\n";
-    m += "\\u8981\\u6539\\u76ee\\u6a19 WiFi \\u8acb\\u9ede\\uff1a\n";
+         jsonEscape(String(connectedSsid)) + "\\n\\n";
+    m += "\\u8981\\u6539\\u76ee\\u6a19 WiFi \\u8acb\\u9ede\\uff1a\\n";
     m += "http://" + ip + "/wifi";
     discordSay(m);
     return;
