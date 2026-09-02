@@ -52,10 +52,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b44-2026.09.03-TEST";
+static const char *FW_VERSION = "b45-2026.09.03";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 44;
+static const uint32_t FW_VERSION_CODE = 45;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -615,12 +615,47 @@ static String extractTopLevelId(const String &json) {
 
 // Formats a unix time as local HH:MM. Alerts are read on a phone, where an
 // absolute clock time is easier to act on than an elapsed-seconds count.
+// Time of day alone is only unambiguous for today. An alert that has been
+// firing since yesterday said "last reported 11:18" with no way to tell which
+// day was meant -- and by the time anyone reads it, that is the normal case:
+// a node stays down until somebody drives out to it. So the date is included
+// as soon as the timestamp is not from today, and left off when it is, which
+// keeps the common alert short.
+// "2305 分鐘" is arithmetic homework, not information. Past an hour the useful
+// unit is hours, and past a day it is days -- the reader wants to know roughly
+// how long this has been going on, not the exact minute count.
+static String humanDuration(uint32_t seconds) {
+  char buf[32];
+  if (seconds < 3600)
+    snprintf(buf, sizeof(buf), "%lu \\u5206\\u9418",
+             (unsigned long)(seconds / 60));  // 分鐘
+  else if (seconds < 86400)
+    snprintf(buf, sizeof(buf), "%lu \\u5c0f\\u6642 %lu \\u5206",
+             (unsigned long)(seconds / 3600),
+             (unsigned long)((seconds % 3600) / 60));  // 小時 分
+  else
+    snprintf(buf, sizeof(buf), "%lu \\u5929 %lu \\u5c0f\\u6642",
+             (unsigned long)(seconds / 86400),
+             (unsigned long)((seconds % 86400) / 3600));  // 天 小時
+  return String(buf);
+}
+
 static String localHhMm(time_t t) {
   if (t < 1600000000) return "\\u4e0d\\u660e";  // unknown
+
   struct tm tm;
   localtime_r(&t, &tm);
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+
+  time_t now = time(nullptr);
+  struct tm nowTm;
+  localtime_r(&now, &nowTm);
+
+  char buf[24];
+  if (tm.tm_year == nowTm.tm_year && tm.tm_yday == nowTm.tm_yday)
+    snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+  else
+    snprintf(buf, sizeof(buf), "%d/%d %02d:%02d", tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min);
   return String(buf);
 }
 
@@ -645,7 +680,7 @@ static String discordNotify(const String &nodeId, const String &reason,
     content += "\\uff08\\u7b2c " + String(notifyCount) + " \\u6b21\\u63d0\\u9192\\uff09";
   content += "\\n";
   content += "\\u6700\\u5f8c\\u56de\\u5831\\uff1a" + localHhMm(lastSeen) + "\\n";
-  content += "\\u5df2\\u4e2d\\u65b7\\uff1a" + String(staleFor / 60) + " \\u5206\\u9418\\n";
+  content += "\\u5df2\\u4e2d\\u65b7\\uff1a" + humanDuration(staleFor) + "\\n";
   if (lastReading.length())
     content += "\\u6700\\u5f8c\\u8b80\\u503c\\uff1a" + lastReading + "\\n";
   content += "\\u539f\\u56e0\\uff1a" + reason + "\\n";
@@ -818,8 +853,8 @@ static void driveNotifications(const String &id, uint32_t staleFor,
   st.lastTry = now;
 
   // "超過 %d 分鐘未回報" -- exceeded N minutes without reporting
-  String reason = "\\u8d85\\u904e " + String(staleFor / 60) +
-                  " \\u5206\\u9418\\u672a\\u56de\\u5831";
+  String reason = "\\u8d85\\u904e " + humanDuration(staleFor) +
+                  "\\u672a\\u56de\\u5831";
   String msgId =
       discordNotify(id, reason, staleFor, lastSeen, lastReading,
                     st.sentCount + 1);
@@ -882,7 +917,7 @@ static void announceNodeMove(const String &id, const String &obj,
   m += "\\u73fe\\u5728\\uff1a" + jsonEscape(ssid) + "\\n";
   if (ip.length()) {
     m += "\\n\\u8981\\u6539\\u5b83\\u7684 WiFi \\u8acb\\u9ede\\uff1a\\n";
-    m += "http://" + jsonEscape(ip) + "/wifi";
+    m += "http://" + jsonEscape(ip) + "/wifi?pass=" + String(OTA_PASSWORD);
   }
   if (discordSay(m))
     logLine("%s moved %s -> %s, announced", id.c_str(), from.c_str(),
@@ -1160,7 +1195,7 @@ static void announceWiFiState() {
     m += "\\u76ee\\u524d\\u9023\\u4e0a\\uff1a" +
          jsonEscape(String(connectedSsid)) + "\\n\\n";
     m += "\\u8981\\u6539\\u76ee\\u6a19 WiFi \\u8acb\\u9ede\\uff1a\\n";
-    m += "http://" + ip + "/wifi";
+    m += "http://" + ip + "/wifi?pass=" + String(OTA_PASSWORD);
     discordSay(m);
     return;
   }
@@ -1175,7 +1210,7 @@ static void announceWiFiState() {
     m += "\\u76ee\\u524d\\u5728\\u6551\\u63f4\\u71b1\\u9ede\\uff1a" +
          jsonEscape(String(connectedSsid)) + "\\n\\n";
     m += "\\u8acb\\u9ede\\u4e0b\\u9762\\u9023\\u7d50\\u8a2d\\u5b9a\\u65b0\\u7684 WiFi\\uff1a\\n";
-    m += "http://" + ip + "/wifi";
+    m += "http://" + ip + "/wifi?pass=" + String(OTA_PASSWORD);
     discordSay(m);
     return;
   }
