@@ -474,6 +474,21 @@ static bool rtdbRequest(const char *method, const String &path,
 // Minimal field extraction. A full JSON parse of /devices would need more
 // heap than the response is worth; these readings are flat numbers and short
 // strings at a known depth, so a scan is enough and cannot fragment the heap.
+// Same idea as extractNumber for the short string fields -- ssid and ip. No
+// unescaping: these come from our own firmware, which already scrubs quotes
+// and backslashes before publishing them.
+static bool extractString(const String &json, int from, const char *key,
+                          String *out) {
+  String needle = String("\"") + key + "\":\"";
+  int k = json.indexOf(needle, from);
+  if (k < 0) return false;
+  int v = k + needle.length();
+  int e = json.indexOf('"', v);
+  if (e < 0) return false;
+  *out = json.substring(v, e);
+  return true;
+}
+
 static bool extractNumber(const String &json, int from, const char *key,
                           double *out) {
   String needle = String("\"") + key + "\":";
@@ -691,6 +706,10 @@ struct NotifyState {
   int sentCount;     // shown in the message so repeats are distinguishable
   bool alertActive;  // mirrors /alerts/<id>/active, so no refetch per check
   bool inUse;
+  // The network the node last reported being on, so a move is noticed once
+  // rather than announced every minute for as long as it stays there.
+  String lastSsid;
+  bool announcedMove;
   time_t lastTry;    // when we last attempted a post, success or not
   uint32_t failures; // consecutive failed posts, drives the backoff
 
@@ -701,6 +720,8 @@ struct NotifyState {
     sentCount = 0;
     lastTry = 0;
     failures = 0;
+    lastSsid = "";
+    announcedMove = false;
   }
 };
 
@@ -789,6 +810,55 @@ static void driveNotifications(const String &id, uint32_t staleFor,
   }
 }
 
+// Defined further down with the rest of the Discord helpers; needed here
+// because the check loop runs before them in the file.
+static bool discordSay(const String &content);
+
+// Speaks for the other nodes, which have no Discord credentials of their own.
+// Reports a node that is alive but on a network other than the one it usually
+// publishes from, and carries the URL of its config form so whoever moved it
+// can point it at a new network by tapping the link.
+//
+// Announced once per move, not once per check: the interesting event is the
+// change, and a node can sit on the family house WiFi for days while it is
+// being worked on.
+static void announceNodeMove(const String &id, const String &obj,
+                             bool isStale) {
+  // A stale node's last report is history, not where it is now.
+  if (isStale) return;
+
+  String ssid, ip;
+  if (!extractString(obj, 0, "ssid", &ssid) || !ssid.length()) return;
+
+  NotifyState &ns = notifyState(id);
+
+  // First sighting: adopt whatever it says without announcing. Otherwise every
+  // reboot of this device would re-announce every node.
+  if (!ns.lastSsid.length()) {
+    ns.lastSsid = ssid;
+    return;
+  }
+  if (ssid == ns.lastSsid) return;
+
+  String from = ns.lastSsid;
+  ns.lastSsid = ssid;
+
+  extractString(obj, 0, "ip", &ip);
+
+  // 節點換了網路
+  String m = "\u2139\ufe0f **" + jsonEscape(id) +
+             " \u63db\u4e86\u7db2\u8def**\n";
+  m += "\u539f\u672c\uff1a" + jsonEscape(from) + "\n";
+  m += "\u73fe\u5728\uff1a" + jsonEscape(ssid) + "\n";
+  if (ip.length()) {
+    m += "\n\u8981\u6539\u5b83\u7684 WiFi \u8acb\u9ede\uff1a\n";
+    m += "http://" + jsonEscape(ip) + "/wifi";
+  }
+  if (discordSay(m))
+    logLine("%s moved %s -> %s, announced", id.c_str(), from.c_str(),
+            ssid.c_str());
+}
+
 // ---- the check --------------------------------------------------------
 static void runCheck() {
   checksRun++;
@@ -843,6 +913,15 @@ static void runCheck() {
     bool isStale = age > limit;
 
     summary += id + "=" + String(age) + "s" + (isStale ? "(STALE) " : "(ok) ");
+
+    // A node that is publishing happily but from an unexpected network has not
+    // failed -- it has been carried somewhere, which is the recovery plan for
+    // a board that stopped working. Nobody would otherwise be told: it is not
+    // stale, so no alert fires, and only this device has both the ssid the
+    // node reports and a way to say anything on Discord. The other nodes have
+    // no Discord credentials at all, which is why this is announced on their
+    // behalf rather than by them.
+    announceNodeMove(id, obj, isStale);
 
     // Transition detection uses state this device already holds, rather than
     // re-fetching /alerts/<id>/active every minute: each such fetch was a full
