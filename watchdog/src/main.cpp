@@ -201,14 +201,19 @@ static void blinkColor(StatusColor c, int times, int onMs) {
 //   1. NVS target        what /wifi last stored; the normal case
 //   2. NVS target_prev   the target before that, so a mistyped SSID undoes
 //                        itself instead of stranding the board
-//   3. NVS rescue        the hand-opened phone hotspot
-//   4. WIFI_NETWORKS     factory defaults from secrets.h, the final safety net
+//   3. WIFI_NETWORKS     the known sites from secrets.h -- the Taipei bench, the
+//                        family house, the pond
+//   4. NVS rescue        the hand-opened phone hotspot
 //
-// The rescue hotspot is deliberately last of the reachable options rather than
-// first. It is normally switched off, so trying it early would cost a 12s
-// timeout on every single boot for a network that is not there -- and if it
-// ever were left on, the board would leave a perfectly good target network to
-// sit on someone's mobile data.
+// Ordered by what each one costs to use, cheapest first. The known sites need
+// nobody to do anything, so they come before the hotspot: the real recovery
+// plan for a board that has stopped working is that someone unplugs it and
+// carries it back to the family house, where step 3 picks it up and it can be
+// fixed remotely at leisure. The hotspot only exists while a person is
+// standing there holding it open, so it is the last thing tried -- and being
+// last also means the 12s it costs is only ever spent once everything else has
+// already failed, rather than on every boot for a network that is switched
+// off.
 struct WiFiNetwork {
   const char *ssid;
   const char *pass;
@@ -372,24 +377,10 @@ static bool connectWiFi() {
     }
   }
 
-  // 3. the rescue hotspot
-  Credentials rescue = storedRescue();
-  if (tryNetwork(rescue.ssid, rescue.pass)) {
-    onRescueNetwork = true;
-    // The pending target failed and nothing older worked either. Drop the
-    // pending mark so the next boot does not re-run this same dance, but keep
-    // whatever is stored: the form shows it, and it is the only record of what
-    // was attempted.
-    if (pending) {
-      clearPending();
-      wifiReverted = true;
-    }
-    connectedSsidStore = rescue.ssid;
-    connectedSsid = connectedSsidStore.c_str();
-    return true;
-  }
-
-  // 4. factory defaults
+  // 3. the known sites. These need nobody to do anything, which is why they
+  //    come before the hotspot: a board that has stopped working gets
+  //    unplugged and carried back to the family house, and this is the step
+  //    that catches it when it is plugged in there.
   for (const WiFiNetwork &n : NETWORKS) {
     if (tryNetwork(n.ssid, n.pass)) {
       if (pending) {
@@ -400,6 +391,26 @@ static bool connectWiFi() {
       connectedSsid = connectedSsidStore.c_str();
       return true;
     }
+  }
+
+  // 4. the rescue hotspot, last because it is the only option that costs
+  //    somebody something: it exists only while a person is holding it open.
+  //    Worth trying for the case where the board cannot be moved, or moving it
+  //    is not worth the trip.
+  Credentials rescue = storedRescue();
+  if (tryNetwork(rescue.ssid, rescue.pass)) {
+    onRescueNetwork = true;
+    // The pending target failed and nothing else worked either. Drop the
+    // pending mark so the next boot does not re-run this same dance, but keep
+    // what is stored: the form shows it, and it is the only record of what was
+    // attempted.
+    if (pending) {
+      clearPending();
+      wifiReverted = true;
+    }
+    connectedSsidStore = rescue.ssid;
+    connectedSsid = connectedSsidStore.c_str();
+    return true;
   }
   return false;
 }
