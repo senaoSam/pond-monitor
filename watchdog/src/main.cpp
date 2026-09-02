@@ -52,10 +52,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b43-2026.09.03-TEST";
+static const char *FW_VERSION = "b44-2026.09.03-TEST";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 43;
+static const uint32_t FW_VERSION_CODE = 44;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -302,6 +302,27 @@ static void storeRescue(const String &ssid, const String &pass) {
   wifiPrefs.begin("wifi", false);
   wifiPrefs.putString("rssid", ssid);
   wifiPrefs.putString("rpass", pass);
+  wifiPrefs.end();
+}
+
+// Forgets both stored targets, so the next boot starts from the known sites as
+// if the board had never been configured.
+//
+// Needed because every /wifi call stores the network that currently works as
+// the previous target -- which is exactly right in the field, and exactly what
+// makes the later steps unreachable on the bench: step 2 catches the board
+// every time, so the rescue hotspot can never be exercised no matter how many
+// bad SSIDs are tried.
+//
+// Also the honest way to hand a board on to a new site: without it, the old
+// pond's credentials stay one layer down for the rest of the board's life.
+static void clearTargets() {
+  wifiPrefs.begin("wifi", false);
+  wifiPrefs.remove("ssid");
+  wifiPrefs.remove("pass");
+  wifiPrefs.remove("pssid");
+  wifiPrefs.remove("ppass");
+  wifiPrefs.remove("pending");
   wifiPrefs.end();
 }
 
@@ -1274,6 +1295,19 @@ static bool configAuthorised() {
 static void handleWifiConfig() {
   if (!configAuthorised()) {
     server.send(403, "text/plain; charset=utf-8", "bad pass");
+    return;
+  }
+
+  // Checked before the ssid, so clear=1 needs no other parameter.
+  if (server.arg("clear") == "1") {
+    clearTargets();
+    logLine("wifi targets cleared, rebooting");
+    // savedPage renders into HTML, not into a JSON body, so the Chinese goes
+    // in as itself rather than as \uXXXX escapes.
+    server.send(200, "text/html; charset=utf-8",
+                savedPage(String(F("(已清除，回到預設網路)"))));
+    delay(1200);
+    ESP.restart();
     return;
   }
 
