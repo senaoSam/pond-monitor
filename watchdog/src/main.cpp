@@ -52,10 +52,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b45-2026.09.03";
+static const char *FW_VERSION = "b46-2026.09.04";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 45;
+static const uint32_t FW_VERSION_CODE = 46;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -352,6 +352,12 @@ static void revertTarget() {
 
 // ---- connecting ---------------------------------------------------------
 
+// Filled in by tryNetwork as the boot proceeds and read by the incident
+// record; defined here because the connection code runs before that module.
+static String bootAttempts;
+static uint32_t bootWifiMs;
+static uint32_t bootPasses;
+
 // What this boot tried and how it went, so the status page and the Discord
 // announcement can explain the situation without re-deriving it. RAM only.
 static String wifiAttemptedSsid = "";
@@ -365,11 +371,26 @@ static bool onKnownSite = false;
 
 static bool tryNetwork(const String &ssid, const String &pass) {
   if (!ssid.length()) return false;
+  uint32_t started = millis();
   WiFi.begin(ssid.c_str(), pass.c_str());
-  uint32_t deadline = millis() + WIFI_ATTEMPT_MS;
+  uint32_t deadline = started + WIFI_ATTEMPT_MS;
   while (WiFi.status() != WL_CONNECTED && millis() < deadline)
     blinkColor(BLUE, 1, 250);
-  if (WiFi.status() == WL_CONNECTED) return true;
+
+  // Each outcome goes into the boot record. Which networks were tried, in
+  // what order, and how long each took is what separates "wrong password"
+  // (fails fast) from "router not answering" (runs the full timeout) from
+  // "weak signal" (connects, but slowly and at a poor RSSI).
+  uint32_t took = millis() - started;
+  bool ok = WiFi.status() == WL_CONNECTED;
+  if (bootAttempts.length()) bootAttempts += " ";
+  bootAttempts += ssid + (ok ? ":ok(" : ":fail(") + String(took / 1000.0, 1) +
+                  "s";
+  if (ok) bootAttempts += "," + String(WiFi.RSSI()) + "dBm";
+  bootAttempts += ")";
+  bootWifiMs += took;
+
+  if (ok) return true;
   WiFi.disconnect();
   return false;
 }
@@ -452,6 +473,34 @@ static bool connectWiFi() {
   return false;
 }
 
+// RTC_SW_* is our own ESP.restart(), *WDT_* is a hang, BROWNOUT is the supply
+// sagging (a thin USB cable does this), and PANIC is a crash.
+// Enum names are the ESP32-S3 set; the S3 has no plain SW_CPU_RESET.
+static const char *resetReasonName() {
+  switch (rtc_get_reset_reason(0)) {
+    case POWERON_RESET:          return "POWERON (power applied)";
+    case RTC_SW_CPU_RESET:       return "SW_CPU (our ESP.restart)";
+    case RTC_SW_SYS_RESET:       return "SW_SYS (our ESP.restart)";
+    case DEEPSLEEP_RESET:        return "DEEPSLEEP";
+    case TG0WDT_SYS_RESET:       return "TASK_WDT0 (hang)";
+    case TG1WDT_SYS_RESET:       return "TASK_WDT1 (hang)";
+    case TG0WDT_CPU_RESET:       return "TASK_WDT0_CPU (hang)";
+    case TG1WDT_CPU_RESET:       return "TASK_WDT1_CPU (hang)";
+    case RTCWDT_SYS_RESET:       return "RTC_WDT (hang)";
+    case RTCWDT_CPU_RESET:       return "RTC_WDT_CPU (hang)";
+    case RTCWDT_RTC_RESET:       return "RTC_WDT_RTC (hang)";
+    case SUPER_WDT_RESET:        return "SUPER_WDT (hang)";
+    case RTCWDT_BROWN_OUT_RESET: return "BROWNOUT (power dip)";
+    case POWER_GLITCH_RESET:     return "POWER_GLITCH (power dip)";
+    case USB_UART_CHIP_RESET:    return "USB_UART (host reset)";
+    case USB_JTAG_CHIP_RESET:    return "USB_JTAG (host reset)";
+    case EFUSE_RESET:            return "EFUSE";
+    case GLITCH_RTC_RESET:       return "GLITCH";
+    case INTRUSION_RESET:        return "INTRUSION";
+    default:                     return "OTHER/PANIC (crash)";
+  }
+}
+
 // ---- rtdb -------------------------------------------------------------
 
 // Discord bodies here are hand-built JSON, and the Chinese in them is written
@@ -532,6 +581,132 @@ static bool extractNumber(const String &json, int from, const char *key,
   if (end == v) return false;
   *out = json.substring(v, end).toDouble();
   return true;
+}
+
+// ---- incident record ---------------------------------------------------
+//
+// The one class of failure this device cannot report is the one where it has
+// no network: a power dip at the pond, a router that went away overnight, a
+// hang. By the time anyone looks, the board has usually been power-cycled by
+// hand and is working again, and whatever happened left no trace.
+//
+// So each boot writes a short record of how the *previous* run ended and how
+// this one came up, and uploads it once there is a network. It answers "what
+// actually happened at 3am" well enough to say which kind of problem it was --
+// power, network, firmware or a person -- which is what decides who has to do
+// something about it.
+//
+// Deliberately one record, overwritten each boot, not a history. Anything
+// worth keeping is in RTDB within a minute of the board coming back; NVS only
+// has to survive the gap.
+//
+// Flash wear is not a concern at this rate. NVS wear-levels across its whole
+// partition and the endurance spec is 100k erases per sector, so one write per
+// boot is decades even if the board rebooted hourly. What would kill it is
+// writing from loop() -- so nothing here is ever called from there.
+
+static Preferences incPrefs;
+
+// Written continuously while healthy, read back on the next boot. Together
+// with the reset reason it separates a power cut from a person unplugging the
+// board: a POWERON whose last heartbeat was seconds ago is a supply that
+// vanished without warning, while one whose last heartbeat was hours ago is
+// somebody who pulled the plug and put it back later.
+static const uint32_t BEAT_INTERVAL_S = 60;
+static uint32_t lastBeatWrite = 0;
+
+// What the previous run left behind, read once at boot.
+struct PrevRun {
+  bool present;
+  uint32_t lastBeat;    // unix seconds of the last healthy heartbeat
+  uint32_t uptime;      // how long that run had been going, seconds
+  uint32_t bootCount;   // total boots, so a reboot loop is visible as a number
+};
+static PrevRun prevRun = {false, 0, 0, 0};
+
+// This boot, filled in as it happens.
+static void incidentBegin() {
+  incPrefs.begin("inc", false);
+  prevRun.lastBeat = incPrefs.getUInt("beat", 0);
+  prevRun.uptime = incPrefs.getUInt("up", 0);
+  prevRun.bootCount = incPrefs.getUInt("boots", 0);
+  prevRun.present = prevRun.lastBeat > 0 || prevRun.bootCount > 0;
+  incPrefs.putUInt("boots", prevRun.bootCount + 1);
+  // Clear the uptime immediately: if this boot dies before writing its own,
+  // the next one should see 0 rather than inherit a stale figure.
+  incPrefs.putUInt("up", 0);
+  incPrefs.end();
+}
+
+// Called from loop() while things are healthy -- but only actually writes once
+// a minute, which is the whole reason this is safe to call from there.
+static void incidentHeartbeat() {
+  time_t now = time(nullptr);
+  if (now < 1600000000) return;  // no clock, a timestamp would be meaningless
+  if (lastBeatWrite && (millis() - lastBeatWrite) < BEAT_INTERVAL_S * 1000)
+    return;
+  lastBeatWrite = millis();
+
+  incPrefs.begin("inc", false);
+  incPrefs.putUInt("beat", (uint32_t)now);
+  incPrefs.putUInt("up", millis() / 1000);
+  incPrefs.end();
+}
+
+// True when this boot is worth reporting. A clean restart that came straight
+// back up is not an incident -- reporting every reboot would bury the ones
+// that matter, and most reboots here are our own OTA.
+static bool incidentWorthReporting(const char *reset) {
+  if (bootPasses > 0) return true;              // wifi did not work first try
+  if (strstr(reset, "hang")) return true;       // any watchdog
+  if (strstr(reset, "BROWNOUT")) return true;   // supply dipped
+  if (strstr(reset, "GLITCH")) return true;
+  if (strstr(reset, "PANIC")) return true;
+  if (strstr(reset, "crash")) return true;
+  // A power-on whose previous run was still beating moments ago is a supply
+  // that disappeared with no warning -- the signature of a dip too fast for
+  // the brownout detector, which otherwise looks exactly like a normal start.
+  if (strstr(reset, "POWERON") && prevRun.present && prevRun.lastBeat) {
+    time_t now = time(nullptr);
+    if (now > (time_t)prevRun.lastBeat &&
+        (uint32_t)(now - prevRun.lastBeat) < 180)
+      return true;
+  }
+  return false;
+}
+
+// Uploads the record and clears the marker. Best-effort: if RTDB is
+// unreachable the record stays in NVS and the next boot tries again.
+static void incidentReport(const char *rtdbHost, const char *deviceId) {
+  const char *reset = resetReasonName();
+  if (!incidentWorthReporting(reset)) return;
+
+  time_t now = time(nullptr);
+  if (now < 1600000000) return;  // key would be meaningless
+
+  String body = "{";
+  body += "\"reset\":\"" + String(reset) + "\"";
+  body += ",\"boots\":" + String(prevRun.bootCount + 1);
+  if (prevRun.lastBeat) {
+    body += ",\"lastBeat\":" + String(prevRun.lastBeat);
+    body += ",\"gap\":" + String((uint32_t)(now - (time_t)prevRun.lastBeat));
+  }
+  body += ",\"prevUptime\":" + String(prevRun.uptime);
+  body += ",\"wifiMs\":" + String(bootWifiMs);
+  body += ",\"wifiPasses\":" + String(bootPasses);
+  body += ",\"attempts\":\"" + jsonEscape(bootAttempts) + "\"";
+  body += ",\"ssid\":\"" + jsonEscape(String(connectedSsid)) + "\"";
+  body += ",\"rssi\":" + String(WiFi.RSSI());
+  body += ",\"fw\":" + String(FW_VERSION_CODE);
+  body += ",\"heap\":" + String(ESP.getFreeHeap());
+  body += "}";
+
+  String path = "/incidents/" + String(deviceId) + "/" +
+                String((uint32_t)now) + ".json";
+  if (rtdbRequest("PUT", path, body, nullptr))
+    logLine("incident reported: %s", reset);
+  else
+    logLine("incident report FAILED: %s", lastError.c_str());
 }
 
 // ---- discord ----------------------------------------------------------
@@ -1075,33 +1250,6 @@ static bool publishMeta() {
 
 // Names the cause of the most recent boot -- the first thing to look at when a
 // board has been rebooting on its own. The distinction that matters here:
-// RTC_SW_* is our own ESP.restart(), *WDT_* is a hang, BROWNOUT is the supply
-// sagging (a thin USB cable does this), and PANIC is a crash.
-// Enum names are the ESP32-S3 set; the S3 has no plain SW_CPU_RESET.
-static const char *resetReasonName() {
-  switch (rtc_get_reset_reason(0)) {
-    case POWERON_RESET:          return "POWERON (power applied)";
-    case RTC_SW_CPU_RESET:       return "SW_CPU (our ESP.restart)";
-    case RTC_SW_SYS_RESET:       return "SW_SYS (our ESP.restart)";
-    case DEEPSLEEP_RESET:        return "DEEPSLEEP";
-    case TG0WDT_SYS_RESET:       return "TASK_WDT0 (hang)";
-    case TG1WDT_SYS_RESET:       return "TASK_WDT1 (hang)";
-    case TG0WDT_CPU_RESET:       return "TASK_WDT0_CPU (hang)";
-    case TG1WDT_CPU_RESET:       return "TASK_WDT1_CPU (hang)";
-    case RTCWDT_SYS_RESET:       return "RTC_WDT (hang)";
-    case RTCWDT_CPU_RESET:       return "RTC_WDT_CPU (hang)";
-    case RTCWDT_RTC_RESET:       return "RTC_WDT_RTC (hang)";
-    case SUPER_WDT_RESET:        return "SUPER_WDT (hang)";
-    case RTCWDT_BROWN_OUT_RESET: return "BROWNOUT (power dip)";
-    case POWER_GLITCH_RESET:     return "POWER_GLITCH (power dip)";
-    case USB_UART_CHIP_RESET:    return "USB_UART (host reset)";
-    case USB_JTAG_CHIP_RESET:    return "USB_JTAG (host reset)";
-    case EFUSE_RESET:            return "EFUSE";
-    case GLITCH_RTC_RESET:       return "GLITCH";
-    case INTRUSION_RESET:        return "INTRUSION";
-    default:                     return "OTHER/PANIC (crash)";
-  }
-}
 
 // ---- wifi configuration over http --------------------------------------
 //
@@ -1479,6 +1627,19 @@ static void handleRoot() {
   // the heap has ever come to empty, and the largest block still allocatable
   // (each TLS session needs a big contiguous one).
   b += "last reset: " + String(resetReasonName()) + "\n";
+  b += "boot count: " + String(prevRun.bootCount + 1) + "\n";
+  b += "wifi at boot: " +
+       (bootAttempts.length() ? bootAttempts : String("(none)"));
+  if (bootPasses) b += "  [" + String(bootPasses) + " failed passes]";
+  b += "\n";
+  if (prevRun.lastBeat) {
+    time_t nowT = time(nullptr);
+    b += "prev run: up " + String(prevRun.uptime) + "s, last beat ";
+    b += (nowT > (time_t)prevRun.lastBeat
+              ? String((uint32_t)(nowT - (time_t)prevRun.lastBeat)) + "s ago"
+              : String("(clock moved)"));
+    b += "\n";
+  }
   b += "min free heap ever: " + String(ESP.getMinFreeHeap()) + "\n";
   b += "largest free block: " + String(ESP.getMaxAllocHeap()) + "\n";
   b += "task wdt: " + String(WDT_TIMEOUT_S) + "s\n";
@@ -1661,6 +1822,10 @@ void setup() {
 
   blinkColor(BLUE, 2, 120);
 
+  // Before WiFi: reads what the previous run left behind, and counts this
+  // boot. Must happen even if everything below fails.
+  incidentBegin();
+
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
 
@@ -1677,7 +1842,8 @@ void setup() {
   // hotspot a realistic window, then reboot and let the safety net work.
   uint32_t wifiTries = 0;
   while (!connectWiFi()) {
-    if (++wifiTries >= WIFI_BOOT_ATTEMPTS) {
+    bootPasses = ++wifiTries;
+    if (wifiTries >= WIFI_BOOT_ATTEMPTS) {
       logLine("no wifi after %lu attempts, rebooting",
               (unsigned long)wifiTries);
       setLed(PURPLE);
@@ -1722,6 +1888,9 @@ void setup() {
   // Report what happened to WiFi at boot. After the bot id is known, because
   // that call is the proof Discord is usable at all.
   announceWiFiState();
+
+  // And the machine-readable version, for the failures nobody was awake for.
+  incidentReport(RTDB_HOST, DEVICE_ID);
 
   ArduinoOTA.setHostname(DEVICE_ID);
   ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -1813,6 +1982,10 @@ void loop() {
   // not take the whole update path down with it.
   publishSelf();
   otaMarkRunningFirmwareGood();
+
+  // Records that the board was alive and well at this moment. Rate-limited
+  // internally to once a minute, so calling it from the cycle is cheap.
+  incidentHeartbeat();
 
   // Poll for firmware BEFORE running the checks, not after. Remote update is
   // the only way to fix this board once it is deployed, so it must not sit
