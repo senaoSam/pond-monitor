@@ -52,10 +52,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b48-2026.10.10";
+static const char *FW_VERSION = "b49-2026.10.10";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 48;
+static const uint32_t FW_VERSION_CODE = 49;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -942,11 +942,19 @@ static const uint32_t AIR_DEAD_PINGS = 10;      // missed in a row -> power-cycl
 static const uint32_t AIR_DIAL_TIMEOUT_MS = 90UL * 1000;
 static const int RING_S = 25;
 
-// The phone starts once an episode has gone this many renotify periods
-// without a tick -- three Discord notifications' worth of time. Keyed to time
-// rather than to how many posts succeeded, so a Discord outage cannot hold
-// the phone back.
+// The phone rings together with this Discord notification of an episode --
+// the third -- if none has been ticked: notifications go out at 0, 5 and 10
+// minutes after a node is found stale, so the call lands ~10 minutes in, ~15
+// after the supply actually failed (b48 waited one more period, ~20; the user
+// asked for it with the third). Keyed to time rather than to how many posts
+// succeeded, so a Discord outage cannot hold the phone back.
 static const int NOTIFIES_BEFORE_CALL = 3;
+
+// When an episode's first call is due: the moment its NOTIFIES_BEFORE_CALL-th
+// notification is.
+static time_t callDueAt(time_t episodeAt) {
+  return episodeAt + (NOTIFIES_BEFORE_CALL - 1) * RENOTIFY_S;
+}
 static const uint32_t CALL_REPEAT_S = 10 * 60;
 static const int CALL_MAX = 3;  // rounds per episode
 
@@ -1206,7 +1214,8 @@ struct Batch {
   String msgId;          // last message posted, polled for the tick
   time_t episodeAt = 0;  // when this round of alerting began
   time_t lastSent = 0, ackedAt = 0, lastTry = 0;
-  int sent = 0;          // posts this episode, shown as "第 N 次提醒"
+  int sent = 0;          // posts in all, shown as "第 N 次提醒"
+  int epPosts = 0;       // posts this episode, which set the schedule below
   int calls = 0;         // phone rounds this episode
   uint32_t failures = 0; // consecutive failed posts, drives the backoff
 };
@@ -1289,7 +1298,7 @@ static String alertText(int b, time_t now) {
       c += "⚠️ 魚塭 " + String((char)('A' + s)) + " 全部 " +
            String(siteTotal[s]) + " 片都失聯 → 比較可能是網路問題\\n";
 
-  time_t callFrom = B.episodeAt + NOTIFIES_BEFORE_CALL * RENOTIFY_S;
+  time_t callFrom = callDueAt(B.episodeAt);
   if (B.calls > 0)
     c += "已撥電話：" + String(B.calls) + " 次\\n";
   else if (callFrom > now)
@@ -1330,6 +1339,7 @@ static void driveBatches(time_t now) {
       B.ackedAt = 0;
       B.lastSent = 0;
       B.episodeAt = now;
+      B.epPosts = 0;
       B.calls = 0;
     }
   }
@@ -1341,7 +1351,7 @@ static void driveBatches(time_t now) {
   for (int b = 0; b < MAX_BATCHES; b++) {
     const Batch &B = batches[b];
     if (B.inUse && !B.ackedAt && B.calls < CALL_MAX &&
-        now >= B.episodeAt + NOTIFIES_BEFORE_CALL * RENOTIFY_S)
+        now >= callDueAt(B.episodeAt))
       due = true;
   }
   if (due && (!lastPhoneAt || (uint32_t)(now - lastPhoneAt) >= CALL_REPEAT_S)) {
@@ -1349,7 +1359,7 @@ static void driveBatches(time_t now) {
     for (int b = 0; b < MAX_BATCHES; b++) {
       Batch &B = batches[b];
       if (B.inUse && !B.ackedAt && B.calls < CALL_MAX &&
-          now >= B.episodeAt + NOTIFIES_BEFORE_CALL * RENOTIFY_S)
+          now >= callDueAt(B.episodeAt))
         B.calls++;
     }
     logLine("unacknowledged alerts, phoning");
@@ -1364,7 +1374,11 @@ static void driveBatches(time_t now) {
   for (int b = 0; b < MAX_BATCHES; b++) {
     Batch &B = batches[b];
     if (!B.inUse || B.ackedAt) continue;
-    if (B.lastSent && (uint32_t)(now - B.lastSent) < RENOTIFY_S) continue;
+    // On a fixed timetable from the episode start -- 0, 5, 10 minutes -- not
+    // RENOTIFY_S after the previous post. Checks run once a minute, so pacing
+    // off the last post let each one slip by up to a check and the third
+    // landed a minute or two after the phone, which is due at 10 minutes.
+    if (B.epPosts && now < B.episodeAt + (time_t)B.epPosts * RENOTIFY_S) continue;
     if (B.failures) {
       uint32_t wait = RENOTIFY_S << (B.failures - 1 < 4 ? B.failures - 1 : 4);
       if ((uint32_t)(now - B.lastTry) < wait) continue;
@@ -1375,6 +1389,11 @@ static void driveBatches(time_t now) {
       B.msgId = msgId;
       B.lastSent = now;
       B.sent++;
+      // Skip to the current slot rather than catch up on missed ones: after a
+      // Discord outage the timetable is behind, and catching up would post
+      // once a minute until it was not.
+      int slot = (int)((now - B.episodeAt) / RENOTIFY_S) + 1;
+      B.epPosts = B.epPosts + 1 > slot ? B.epPosts + 1 : slot;
       B.failures = 0;
       notifySent++;
       logLine("batch %d notified (%d nodes, #%d)", b, batchMembers(b), B.sent);
