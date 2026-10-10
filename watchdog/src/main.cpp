@@ -52,10 +52,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b46-2026.09.04";
+static const char *FW_VERSION = "b47-2026.10.10";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 46;
+static const uint32_t FW_VERSION_CODE = 47;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -839,9 +839,12 @@ static String localHhMm(time_t t) {
 //
 // Text is escaped as \uXXXX rather than literal UTF-8: the body is hand-built
 // JSON, and raw multibyte characters there are easy to corrupt.
+// `callsMade` and `callInMin` add one line about the phone: how many times it
+// has rung, or else in how many minutes it will if nobody ticks.
 static String discordNotify(const String &nodeId, const String &reason,
                             uint32_t staleFor, time_t lastSeen,
-                            const String &lastReading, int notifyCount) {
+                            const String &lastReading, int notifyCount,
+                            int callsMade, int callInMin) {
   // Renders as:
   //   @owner ⚠️ **pond-site 失聯**（第 2 次提醒）
   //   最後回報：01:45
@@ -859,6 +862,13 @@ static String discordNotify(const String &nodeId, const String &reason,
   if (lastReading.length())
     content += "\\u6700\\u5f8c\\u8b80\\u503c\\uff1a" + lastReading + "\\n";
   content += "\\u539f\\u56e0\\uff1a" + reason + "\\n";
+  if (callsMade > 0)  // 已撥電話：N 次
+    content += "\\u5df2\\u64a5\\u96fb\\u8a71\\uff1a" + String(callsMade) +
+               " \\u6b21\\n";
+  else if (callInMin > 0)  // N 分鐘內沒人確認會撥電話
+    content += String(callInMin) +
+               " \\u5206\\u9418\\u5167\\u6c92\\u4eba\\u78ba\\u8a8d\\u6703"
+               "\\u64a5\\u96fb\\u8a71\\n";
   content += "\\u9ede \\u2705 \\u56de\\u5831\\u5df2\\u77e5\\u6089\\uff08\\u975c\\u97f3 " +
              String(ACK_MUTE_S / 60) + " \\u5206\\u9418\\uff09";
 
@@ -934,6 +944,223 @@ static bool writeAlert(const String &id, bool active, time_t lastSeen,
   return rtdbRequest("PATCH", "/alerts/" + id + ".json", body, nullptr);
 }
 
+// ---- phone: the Air724UG dialer ---------------------------------------
+//
+// A Discord mention at 3am is easy to sleep through, so an alert nobody has
+// ticked eventually rings a phone. The ringing is done by an Air724UG 4G
+// module (air-dialer/) on UART1, over VoLTE. It never touches the internet:
+// it is on a prepaid card that bills data by the MB, while an unanswered call
+// -- which is the alarm -- costs nothing. Everything that needs the network
+// stays here, on the house WiFi.
+//
+// Protocol, one line each way (see air-dialer/dialer.lua):
+//   PING                     -> PONG csq=<n> reg=<0|1> ims=<0|1>
+//   LINK                     (sent on each PONG: "I heard you")
+//   DIAL <num> <ring_s> <node> <min> -> ACK, later DONE <outcome>
+//   (module boot)            -> READY <version>
+//
+// Driven from loop() without blocking: a call takes ~30s, and waiting for it
+// in place would stall HTTP, OTA and the task watchdog for that long.
+//
+// Wiring: GPIO17 -> module RXD1, GPIO18 <- module TXD1, GND common, and
+// GPIO16 -> PWR_EN. PWR_EN low cuts the module's power and floating powers
+// it, so the pin is left as an input except to power-cycle a module that has
+// stopped answering.
+static const int AIR_TX_PIN = 17;
+static const int AIR_RX_PIN = 18;
+static const int AIR_EN_PIN = 16;
+// Every 30s, because the module's DTU LED shows the link from these: steady
+// once PINGs arrive and our LINK replies do too, so whoever wires the boards
+// up on site can see within half a minute whether it is right. UART costs
+// nothing. The power-cycle threshold is counted in PINGs, so it is set to
+// keep about five minutes of silence before acting.
+static const uint32_t AIR_PING_EVERY_MS = 30UL * 1000;
+static const uint32_t AIR_PONG_WAIT_MS = 5000;
+static const uint32_t AIR_DEAD_PINGS = 10;      // missed in a row -> power-cycle
+static const uint32_t AIR_DIAL_TIMEOUT_MS = 90UL * 1000;
+static const int RING_S = 25;
+
+// The phone starts once an episode has gone this many renotify periods
+// without a tick -- three Discord notifications' worth of time. Keyed to time
+// rather than to how many posts succeeded, so a Discord outage cannot hold
+// the phone back.
+static const int NOTIFIES_BEFORE_CALL = 3;
+static const uint32_t CALL_REPEAT_S = 10 * 60;
+static const int CALL_MAX = 3;  // rounds per episode
+
+static const char *CALL_NUMBER_LIST[] = CALL_NUMBERS;
+static const int CALL_NUMBER_COUNT =
+    sizeof(CALL_NUMBER_LIST) / sizeof(CALL_NUMBER_LIST[0]);
+
+static bool discordSay(const String &content);
+
+struct AirStatus {
+  bool everAnswered = false;
+  int csq = -1, reg = -1, ims = -1;
+  uint32_t lastPongMs = 0;
+  uint32_t missed = 0;      // PINGs in a row without a PONG
+  uint32_t restarts = 0;    // power-cycles this boot
+  uint32_t cyclesSincePong = 0;
+  uint32_t calls = 0;       // DIALs completed this boot
+  String lastOutcome = "none";
+  String version = "";
+} air;
+
+struct PendingDial {
+  String number, node;
+  uint32_t minutes;
+};
+static PendingDial dialQueue[6];
+static int dialQueueLen = 0;
+static bool dialInFlight = false;
+static uint32_t dialStartMs = 0;
+static String dialNumber;
+static bool pongAwaited = false;
+static uint32_t pingSentMs = 0;
+static uint32_t nextPingMs = 15000;  // first PING shortly after boot
+static String airLine;
+
+// Queues one call per configured number. Node ids are sent as-is: they are
+// our own RTDB keys (no spaces), and the module reads them out by TTS.
+static void airDial(const String &node, uint32_t minutes) {
+  for (int i = 0; i < CALL_NUMBER_COUNT; i++) {
+    if (dialQueueLen >= (int)(sizeof(dialQueue) / sizeof(dialQueue[0]))) {
+      logLine("air: dial queue full, dropping %s", CALL_NUMBER_LIST[i]);
+      continue;
+    }
+    dialQueue[dialQueueLen++] = {CALL_NUMBER_LIST[i], node, minutes};
+  }
+}
+
+static void airSend(const String &line) {
+  Serial1.print(line + "\n");
+}
+
+static void airHandleLine(String line) {
+  line.trim();
+  if (!line.length()) return;
+  if (line.startsWith("PONG")) {
+    pongAwaited = false;
+    air.missed = 0;
+    air.everAnswered = true;
+    air.lastPongMs = millis();
+    air.cyclesSincePong = 0;
+    int k;
+    if ((k = line.indexOf("csq=")) >= 0) air.csq = line.substring(k + 4).toInt();
+    if ((k = line.indexOf("reg=")) >= 0) air.reg = line.substring(k + 4).toInt();
+    if ((k = line.indexOf("ims=")) >= 0) air.ims = line.substring(k + 4).toInt();
+    airSend("LINK");  // completes the round trip the module's DTU LED shows
+  } else if (line.startsWith("READY")) {
+    air.version = line.substring(5);
+    air.version.trim();
+    logLine("air: module ready %s", air.version.c_str());
+    nextPingMs = millis();  // light its DTU LED now, not up to 30s later
+  } else if (line.startsWith("DONE")) {
+    if (!dialInFlight) return;
+    dialInFlight = false;
+    air.calls++;
+    air.lastOutcome = line.substring(5);
+    air.lastOutcome.trim();
+    logLine("air: call to %s ended: %s", dialNumber.c_str(),
+            air.lastOutcome.c_str());
+  } else if (line.startsWith("ERR")) {
+    logLine("air: %s", line.c_str());
+    if (dialInFlight) {
+      dialInFlight = false;
+      air.lastOutcome = line;
+    }
+  }
+  // ACK needs nothing: DONE follows.
+}
+
+// Holds PWR_EN low long enough for the module's supply to collapse, then lets
+// it float, which powers it back up.
+static void airPowerCycle() {
+  logLine("air: no answer to %lu PINGs, power-cycling",
+          (unsigned long)air.missed);
+  pinMode(AIR_EN_PIN, OUTPUT);
+  digitalWrite(AIR_EN_PIN, LOW);
+  for (int i = 0; i < 30; i++) {
+    esp_task_wdt_reset();
+    delay(100);
+  }
+  pinMode(AIR_EN_PIN, INPUT);
+  air.restarts++;
+  air.missed = 0;
+  // A dial in flight died with the module.
+  if (dialInFlight) {
+    dialInFlight = false;
+    air.lastOutcome = "module restarted";
+  }
+  nextPingMs = millis() + 60000;  // it needs a while to boot and register
+}
+
+static void airService() {
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (c == '\n') {
+      airHandleLine(airLine);
+      airLine = "";
+    } else if (c != '\r' && airLine.length() < 200) {
+      airLine += c;
+    }
+  }
+
+  if (dialInFlight && millis() - dialStartMs > AIR_DIAL_TIMEOUT_MS) {
+    dialInFlight = false;
+    air.lastOutcome = "timeout";
+    logLine("air: call to %s got no DONE in time", dialNumber.c_str());
+  }
+
+  if (!dialInFlight && dialQueueLen > 0) {
+    PendingDial d = dialQueue[0];
+    for (int i = 1; i < dialQueueLen; i++) dialQueue[i - 1] = dialQueue[i];
+    dialQueueLen--;
+    dialInFlight = true;
+    dialStartMs = millis();
+    dialNumber = d.number;
+    airSend("DIAL " + d.number + " " + String(RING_S) + " " + d.node + " " +
+            String(d.minutes));
+    logLine("air: dialing %s for %s", d.number.c_str(), d.node.c_str());
+    return;
+  }
+
+  if (pongAwaited && millis() - pingSentMs > AIR_PONG_WAIT_MS) {
+    pongAwaited = false;
+    air.missed++;
+    if (air.missed >= AIR_DEAD_PINGS) {
+      // Said on Discord twice at most per stretch of silence -- when the first
+      // power-cycle is tried, and when that did not bring it back -- and
+      // without a mention: it is a degraded alarm path, not a pond outage.
+      if (air.cyclesSincePong == 0)
+        // "📞 撥號模組沒有回應，已斷電重啟"
+        discordSay("\\ud83d\\udcde \\u64a5\\u865f\\u6a21\\u7d44\\u6c92\\u6709"
+                   "\\u56de\\u61c9\\uff0c\\u5df2\\u65b7\\u96fb\\u91cd\\u555f");
+      else if (air.cyclesSincePong == 1)
+        // "📞 撥號模組重啟後仍無回應"
+        discordSay("\\ud83d\\udcde \\u64a5\\u865f\\u6a21\\u7d44\\u91cd\\u555f"
+                   "\\u5f8c\\u4ecd\\u7121\\u56de\\u61c9");
+      air.cyclesSincePong++;
+      airPowerCycle();
+    }
+  }
+
+  if (!dialInFlight && !pongAwaited && (int32_t)(millis() - nextPingMs) >= 0) {
+    nextPingMs = millis() + AIR_PING_EVERY_MS;
+    pongAwaited = true;
+    pingSentMs = millis();
+    airSend("PING");
+  }
+}
+
+// The module counts as healthy while its last PONG is recent and it reports
+// being registered for VoLTE -- the one thing a call actually needs.
+static bool airHealthy() {
+  return air.everAnswered &&
+         millis() - air.lastPongMs < 2 * AIR_PING_EVERY_MS + AIR_PONG_WAIT_MS &&
+         air.ims == 1;
+}
+
 // ---- notification state ----------------------------------------------
 //
 // Per-node so a second node (C) needs no extra code. Kept in RAM only: after
@@ -952,6 +1179,12 @@ struct NotifyState {
   bool announcedMove;
   time_t lastTry;    // when we last attempted a post, success or not
   uint32_t failures; // consecutive failed posts, drives the backoff
+  // The phone. An episode starts when the node goes stale, and again when an
+  // acknowledgement's mute runs out with the node still down; calls are
+  // counted per episode.
+  time_t episodeAt;
+  int calls;
+  time_t lastCallAt;
 
   void reset() {
     msgId = "";
@@ -962,6 +1195,9 @@ struct NotifyState {
     failures = 0;
     lastSsid = "";
     announcedMove = false;
+    episodeAt = 0;
+    calls = 0;
+    lastCallAt = 0;
   }
 };
 
@@ -1011,6 +1247,25 @@ static void driveNotifications(const String &id, uint32_t staleFor,
     logLine("%s mute expired, resuming alerts", id.c_str());
     st.ackedAt = 0;
     st.lastSent = 0;
+    st.episodeAt = 0;  // a fresh episode: the phone waits its turn again
+  }
+
+  // The phone, once the episode has gone NOTIFIES_BEFORE_CALL renotify
+  // periods without a tick. Ahead of the Discord pacing below so it is not
+  // skipped by that early return.
+  if (!st.episodeAt) {
+    st.episodeAt = now;
+    st.calls = 0;
+    st.lastCallAt = 0;
+  }
+  time_t callFrom = st.episodeAt + NOTIFIES_BEFORE_CALL * RENOTIFY_S;
+  if (now >= callFrom && st.calls < CALL_MAX &&
+      (!st.lastCallAt || (uint32_t)(now - st.lastCallAt) >= CALL_REPEAT_S)) {
+    st.calls++;
+    st.lastCallAt = now;
+    logLine("%s unacknowledged for %lus, phoning (round %d)", id.c_str(),
+            (unsigned long)(now - st.episodeAt), st.calls);
+    airDial(id, staleFor / 60);
   }
 
   if (st.lastSent && (uint32_t)(now - st.lastSent) < RENOTIFY_S) return;
@@ -1030,9 +1285,11 @@ static void driveNotifications(const String &id, uint32_t staleFor,
   // "超過 %d 分鐘未回報" -- exceeded N minutes without reporting
   String reason = "\\u8d85\\u904e " + humanDuration(staleFor) +
                   "\\u672a\\u56de\\u5831";
+  int callInMin =
+      callFrom > now ? (int)((callFrom - now + 59) / 60) : 0;
   String msgId =
       discordNotify(id, reason, staleFor, lastSeen, lastReading,
-                    st.sentCount + 1);
+                    st.sentCount + 1, st.calls, callInMin);
   if (msgId.length()) {
     st.msgId = msgId;
     st.lastSent = now;
@@ -1229,6 +1486,24 @@ static bool publishSelf() {
   // network that cannot be scanned from here.
   body += ",\"ssid\":\"" + jsonEscape(String(connectedSsid)) + "\"";
   body += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  // The phone path. The dialer has no internet of its own, so this is the
+  // only place its health is visible from outside: `ok` is the one-glance
+  // answer (answering PINGs and registered for VoLTE), the rest says why not.
+  // Deliberately no "ts" key in here: runCheck() on any watcher takes the
+  // first "ts" under a device as its heartbeat.
+  body += ",\"air\":{";
+  body += "\"ok\":" + String(airHealthy() ? "true" : "false");
+  body += ",\"csq\":" + String(air.csq);
+  body += ",\"reg\":" + String(air.reg);
+  body += ",\"ims\":" + String(air.ims);
+  body += ",\"pongAge\":" +
+          String(air.everAnswered ? (long)((millis() - air.lastPongMs) / 1000)
+                                  : -1L);
+  body += ",\"calls\":" + String(air.calls);
+  body += ",\"last\":\"" + jsonEscape(air.lastOutcome) + "\"";
+  body += ",\"restarts\":" + String(air.restarts);
+  body += ",\"ver\":\"" + jsonEscape(air.version) + "\"";
+  body += "}";
   body += "}";
   body += "}";
   return rtdbRequest("PATCH", "/.json", body, nullptr);
@@ -1586,6 +1861,16 @@ static void handleRoot() {
   b += "discord sent: " + String(notifySent) + "\n";
   b += "discord acked: " + String(notifyAcked) + "\n";
   b += "bot id: " + (botUserId.length() ? botUserId : String("UNKNOWN")) + "\n";
+  b += "dialer: " + String(airHealthy() ? "ok" : "NOT OK") + "  csq=" +
+       String(air.csq) + " reg=" + String(air.reg) + " ims=" + String(air.ims);
+  if (air.everAnswered)
+    b += "  pong " + String((millis() - air.lastPongMs) / 1000) + "s ago";
+  else
+    b += "  never answered";
+  b += "\n";
+  b += "dialer calls: " + String(air.calls) + ", last: " + air.lastOutcome +
+       ", restarts: " + String(air.restarts) +
+       (dialInFlight ? "  [CALLING " + dialNumber + "]" : String("")) + "\n";
   // Which OTA slot is live, and how much room the next update has. A failed
   // "Could Not Activate" points here first.
   const esp_partition_t *run = esp_ota_get_running_partition();
@@ -1680,10 +1965,25 @@ static void handleFwCheck() {
                   otaPullStatus() + "\n");
 }
 
+// Rings every configured number now, for checking the phone path without
+// taking a node down. Guarded like /wifi: each call can cost money if
+// answered, so it is not something a passer-by on the LAN should trigger.
+//   GET /testcall?pass=<OTA_PASSWORD>
+static void handleTestCall() {
+  if (!configAuthorised()) {
+    server.send(403, "text/plain; charset=utf-8", "bad pass");
+    return;
+  }
+  airDial("test", 0);
+  server.send(200, "text/plain; charset=utf-8",
+              "queued " + String(CALL_NUMBER_COUNT) +
+                  " call(s); the result shows on / as \"dialer calls\"\n");
+}
+
 static void handleTestAlert() {
   // "手動測試" -- manual test
   String msgId = discordNotify("TEST", "\\u624b\\u52d5\\u6e2c\\u8a66", 0,
-                               time(nullptr), "28.0 \\u00b0C", 1);
+                               time(nullptr), "28.0 \\u00b0C", 1, 0, 0);
   if (!msgId.length()) {
     server.send(500, "text/plain", "discord post failed: " + lastError + "\n");
     return;
@@ -1822,6 +2122,11 @@ void setup() {
 
   blinkColor(BLUE, 2, 120);
 
+  // The dialer link. PWR_EN floats, which keeps the module powered; it is only
+  // driven to power-cycle it.
+  pinMode(AIR_EN_PIN, INPUT);
+  Serial1.begin(115200, SERIAL_8N1, AIR_RX_PIN, AIR_TX_PIN);
+
   // Before WiFi: reads what the previous run left behind, and counts this
   // boot. Must happen even if everything below fails.
   incidentBegin();
@@ -1919,6 +2224,7 @@ void setup() {
   server.on("/rescue", handleRescueConfig);
   server.on("/check", handleCheckNow);
   server.on("/testalert", handleTestAlert);
+  server.on("/testcall", handleTestCall);
   server.on("/testack", handleTestAck);
   server.on("/fwcheck", handleFwCheck);
   server.on("/verify", handleVerify);
@@ -1949,6 +2255,7 @@ void loop() {
   }
 
   server.handleClient();
+  airService();
 
   if ((int32_t)(millis() - nextCheck) < 0) {
     // Pulse while idle so health is readable at a glance: red means a node is
