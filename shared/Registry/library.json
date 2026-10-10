@@ -1,0 +1,7 @@
+{
+  "name": "Registry",
+  "version": "1.0.0",
+  "description": "Board identity looked up by MAC in RTDB /registry, cached in NVS",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

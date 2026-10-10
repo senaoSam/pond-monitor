@@ -15,9 +15,14 @@
 // A failed version is also recorded, so the board does not download the same
 // broken image forever.
 //
-//   RTDB  /firmware/<device>/version   : integer, bump to trigger an update
-//         /firmware/<device>/url       : https URL of the .bin
+//   RTDB  /firmware/<group>/version    : integer, bump to trigger an update
+//         /firmware/<group>/url        : https URL of the .bin
 //         /fwlog/<device>/<ts>         : one record per update attempt
+//
+// <group> and <device> are the same string for a one-off board (the pond
+// sensor, the watchdog). They differ for the heartbeat boards, where twenty
+// boards each have their own identity but all pull one firmware: the group
+// is what a release targets, the device is whose log an attempt goes in.
 //   NVS   fw.running / fw.pending / fw.bad
 //
 // The log exists because /firmware and meta.fw only ever hold the current
@@ -27,7 +32,8 @@
 // what was actually shipped.
 //
 // Usage from the sketch:
-//   otaPullBegin(DEVICE_ID, FW_VERSION_CODE);   // in setup(), after WiFi
+//   otaPullBegin(RTDB_HOST, DEVICE_ID, FW_VERSION_CODE);         // one-off
+//   otaPullBegin(RTDB_HOST, id, "heartbeat", FW_VERSION_CODE);   // grouped
 //   otaMarkRunningFirmwareGood();               // after the first good cycle
 //   otaPullCheck();                             // periodically, when idle
 
@@ -52,7 +58,10 @@ static const uint32_t OTA_BAD_RETRY_LIMIT = 3;
 
 // ---- state ------------------------------------------------------------
 static Preferences otaPrefs;
-static const char *otaDeviceId = "";
+// Strings, not pointers: on the grouped boards both are computed at boot (the
+// identity comes from the registry), so there is no literal to point at.
+static String otaDeviceId = "";
+static String otaGroup = "";
 static uint32_t otaRunningVersion = 0;
 static bool otaMarkedGood = false;
 // Set at boot when a rollback is detected, logged once the clock is up.
@@ -152,10 +161,11 @@ static void otaMarkRunningFirmwareGood() {
   otaPrefs.end();
 }
 
-static void otaPullBegin(const char *rtdbHost, const char *deviceId,
-                         uint32_t versionCode) {
+static void otaPullBegin(const char *rtdbHost, const String &deviceId,
+                         const String &group, uint32_t versionCode) {
   otaRtdbHost = rtdbHost;
   otaDeviceId = deviceId;
+  otaGroup = group;
   otaRunningVersion = versionCode;
 
   // If we booted into an image that is still pending verification and then
@@ -180,6 +190,15 @@ static void otaPullBegin(const char *rtdbHost, const char *deviceId,
   otaPrefs.end();
 }
 
+// The one-off form, unchanged for the pond sensor and the watchdog: the
+// device pulls from a /firmware entry named after itself.
+static void otaPullBegin(const char *rtdbHost, const char *deviceId,
+                         uint32_t versionCode) {
+  otaPullBegin(rtdbHost, String(deviceId), String(deviceId), versionCode);
+}
+
+static String otaPullGroup() { return otaGroup; }
+
 // ---- update -----------------------------------------------------------
 
 // Reads the target version and URL for this device from RTDB.
@@ -190,7 +209,7 @@ static bool otaFetchTarget(const char *rtdbHost, uint32_t *version,
   client.setTimeout(12000);
 
   HTTPClient http;
-  String u = String("https://") + rtdbHost + "/firmware/" + otaDeviceId +
+  String u = String("https://") + rtdbHost + "/firmware/" + otaGroup +
              ".json";
   if (!http.begin(client, u)) return false;
   http.setTimeout(12000);

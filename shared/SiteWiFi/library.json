@@ -1,0 +1,7 @@
+{
+  "name": "SiteWiFi",
+  "version": "1.0.0",
+  "description": "NVS-stored WiFi with known-site, per-pond RTDB entry and rescue-hotspot fallbacks",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
