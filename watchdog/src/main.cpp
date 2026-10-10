@@ -52,10 +52,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b47-2026.10.10";
+static const char *FW_VERSION = "b48-2026.10.10";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 47;
+static const uint32_t FW_VERSION_CODE = 48;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -834,44 +834,10 @@ static String localHhMm(time_t t) {
   return String(buf);
 }
 
-// Posts the alert and returns the message id, which is what later reaction
-// polling needs. Also pre-seeds the tick so acknowledging is a single tap.
-//
-// Text is escaped as \uXXXX rather than literal UTF-8: the body is hand-built
-// JSON, and raw multibyte characters there are easy to corrupt.
-// `callsMade` and `callInMin` add one line about the phone: how many times it
-// has rung, or else in how many minutes it will if nobody ticks.
-static String discordNotify(const String &nodeId, const String &reason,
-                            uint32_t staleFor, time_t lastSeen,
-                            const String &lastReading, int notifyCount,
-                            int callsMade, int callInMin) {
-  // Renders as:
-  //   @owner ⚠️ **pond-site 失聯**（第 2 次提醒）
-  //   最後回報：01:45
-  //   已中斷：6 分鐘
-  //   最後讀值：26.3 °C
-  //   原因：超過 6 分鐘未回報
-  //   點 ✅ 回報已知悉（靜音 60 分鐘）
-  String content = "<@" + String(DISCORD_USER_ID) + "> \\u26a0\\ufe0f **";
-  content += nodeId + " \\u5931\\u806f**";
-  if (notifyCount > 1)
-    content += "\\uff08\\u7b2c " + String(notifyCount) + " \\u6b21\\u63d0\\u9192\\uff09";
-  content += "\\n";
-  content += "\\u6700\\u5f8c\\u56de\\u5831\\uff1a" + localHhMm(lastSeen) + "\\n";
-  content += "\\u5df2\\u4e2d\\u65b7\\uff1a" + humanDuration(staleFor) + "\\n";
-  if (lastReading.length())
-    content += "\\u6700\\u5f8c\\u8b80\\u503c\\uff1a" + lastReading + "\\n";
-  content += "\\u539f\\u56e0\\uff1a" + reason + "\\n";
-  if (callsMade > 0)  // 已撥電話：N 次
-    content += "\\u5df2\\u64a5\\u96fb\\u8a71\\uff1a" + String(callsMade) +
-               " \\u6b21\\n";
-  else if (callInMin > 0)  // N 分鐘內沒人確認會撥電話
-    content += String(callInMin) +
-               " \\u5206\\u9418\\u5167\\u6c92\\u4eba\\u78ba\\u8a8d\\u6703"
-               "\\u64a5\\u96fb\\u8a71\\n";
-  content += "\\u9ede \\u2705 \\u56de\\u5831\\u5df2\\u77e5\\u6089\\uff08\\u975c\\u97f3 " +
-             String(ACK_MUTE_S / 60) + " \\u5206\\u9418\\uff09";
-
+// Posts an alert and returns the message id, which later reaction polling
+// needs. Also pre-seeds the tick so acknowledging is a single tap. `content`
+// is JSON string source (see alertText).
+static String postAlert(const String &content) {
   String body = "{\"content\":\"" + content + "\"}";
   String resp;
   if (!discordRequest("POST",
@@ -880,13 +846,9 @@ static String discordNotify(const String &nodeId, const String &reason,
     logLine("discord notify FAILED: %s", lastError.c_str());
     return "";
   }
-
-  // The message id is the one at the top level of the response. A plain
-  // search for the first "id" would instead find the id nested inside the
-  // mentions array, so anchor on "channel_id" -- which only appears at the
-  // top level -- and take the last top-level "id" before it.
+  // The message's own id is the one at the top level of the response; the
+  // first "id" in the text belongs to the mentions array instead.
   String msgId = extractTopLevelId(resp);
-
   discordRequest("PUT",
                  "/channels/" + String(DISCORD_CHANNEL_ID) + "/messages/" +
                      msgId + "/reactions/" + ACK_EMOJI + "/@me",
@@ -1119,9 +1081,13 @@ static void airService() {
     dialInFlight = true;
     dialStartMs = millis();
     dialNumber = d.number;
-    airSend("DIAL " + d.number + " " + String(RING_S) + " " + d.node + " " +
-            String(d.minutes));
-    logLine("air: dialing %s for %s", d.number.c_str(), d.node.c_str());
+    // Node and minutes only when there is a node: the module splits on
+    // whitespace, so an empty node would shift the minutes into its place.
+    String cmd = "DIAL " + d.number + " " + String(RING_S);
+    if (d.node.length()) cmd += " " + d.node + " " + String(d.minutes);
+    airSend(cmd);
+    logLine("air: dialing %s%s%s", d.number.c_str(),
+            d.node.length() ? " for " : "", d.node.c_str());
     return;
   }
 
@@ -1161,150 +1127,308 @@ static bool airHealthy() {
          air.ims == 1;
 }
 
-// ---- notification state ----------------------------------------------
+// ---- per-node state ---------------------------------------------------
 //
-// Per-node so a second node (C) needs no extra code. Kept in RAM only: after
-// a reboot the first check re-notifies, which is the safe direction to err.
-struct NotifyState {
-  String nodeId;
-  String msgId;      // last alert message, polled for the ack reaction
-  time_t lastSent;   // when we last posted
-  time_t ackedAt;    // when the owner ticked it, 0 if never
-  int sentCount;     // shown in the message so repeats are distinguishable
-  bool alertActive;  // mirrors /alerts/<id>/active, so no refetch per check
-  bool inUse;
-  // The network the node last reported being on, so a move is noticed once
-  // rather than announced every minute for as long as it stays there.
+// One entry per node seen in /devices. RAM only: after a reboot the first
+// check re-raises whatever is stale, which errs toward notifying.
+//
+// The text added in b48 is written as plain UTF-8. That is valid JSON as it
+// stands; the \uXXXX escapes elsewhere in this file predate it and are left
+// alone.
+struct NodeState {
+  String id;
+  bool inUse = false;
+  bool alertActive = false;  // mirrors /alerts/<id>/active
+  time_t lastSeen = 0;       // its last heartbeat, as of when it went stale
+  int batch = -1;            // the alert batch it is listed in
+  bool seenThisCheck = false;
+  // Refreshed every check, for the alert text.
+  uint32_t age = 0;
+  String note, reading;
+  // The network it last reported, so a move is announced once (see
+  // announceNodeMove) rather than every minute it stays there.
   String lastSsid;
-  bool announcedMove;
-  time_t lastTry;    // when we last attempted a post, success or not
-  uint32_t failures; // consecutive failed posts, drives the backoff
-  // The phone. An episode starts when the node goes stale, and again when an
-  // acknowledgement's mute runs out with the node still down; calls are
-  // counted per episode.
-  time_t episodeAt;
-  int calls;
-  time_t lastCallAt;
-
-  void reset() {
-    msgId = "";
-    lastSent = 0;
-    ackedAt = 0;
-    sentCount = 0;
-    lastTry = 0;
-    failures = 0;
-    lastSsid = "";
-    announcedMove = false;
-    episodeAt = 0;
-    calls = 0;
-    lastCallAt = 0;
-  }
 };
 
-static const int MAX_NODES = 6;
-static NotifyState notifyStates[MAX_NODES];
+// Twenty-odd heartbeat boards plus the one-off nodes, with room to grow. The
+// first version tracked six, which a single pond would have overflowed.
+static const int MAX_NODES = 40;
+static NodeState nodeStates[MAX_NODES];
 
-static NotifyState &notifyState(const String &id) {
+static NodeState &nodeState(const String &id) {
   for (int i = 0; i < MAX_NODES; i++)
-    if (notifyStates[i].inUse && notifyStates[i].nodeId == id)
-      return notifyStates[i];
+    if (nodeStates[i].inUse && nodeStates[i].id == id) return nodeStates[i];
   for (int i = 0; i < MAX_NODES; i++)
-    if (!notifyStates[i].inUse) {
-      notifyStates[i].inUse = true;
-      notifyStates[i].nodeId = id;
-      notifyStates[i].reset();
-      return notifyStates[i];
+    if (!nodeStates[i].inUse) {
+      nodeStates[i] = NodeState();
+      nodeStates[i].inUse = true;
+      nodeStates[i].id = id;
+      return nodeStates[i];
     }
-  return notifyStates[0];  // full: reuse the first rather than overflow
+  // Full. The overflow node goes untracked rather than evicting a real one,
+  // and the log says so.
+  static NodeState overflow;
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    logLine("node table full (%d): %s not tracked", MAX_NODES, id.c_str());
+  }
+  overflow = NodeState();
+  overflow.id = id;
+  return overflow;
 }
 
 static uint32_t notifySent = 0, notifyAcked = 0;
 
-// Decides whether to post now. Called on every check while a node is stale.
-// `lastSeen` and `lastReading` come from the node's own latest/ record, so the
-// alert says when contact was lost and what the last value was.
-static void driveNotifications(const String &id, uint32_t staleFor,
-                               time_t lastSeen, const String &lastReading) {
-  NotifyState &st = notifyState(id);
-  time_t now = time(nullptr);
+// Per site (the id's leading letter: A05 is at pond A), how many nodes there
+// are and how many are stale, from the current check. When every node at a
+// pond goes quiet at once it is far more likely the pond's router or uplink
+// than every supply failing together, and the alert says so.
+static int siteTotal[26], siteStale[26];
 
-  // Poll for an acknowledgement on the message we last sent.
-  if (st.msgId.length() && !st.ackedAt && discordAcked(st.msgId)) {
-    st.ackedAt = now;
-    notifyAcked++;
-    logLine("%s acknowledged, muting %lu min", id.c_str(),
-            (unsigned long)(ACK_MUTE_S / 60));
-    // Mark the RTDB alert too, so a dashboard can show it was seen.
-    rtdbRequest("PATCH", "/alerts/" + id + ".json",
-                "{\"acked\":true,\"ackedAt\":" + String((uint32_t)now) + "}",
-                nullptr);
+static int siteIndex(const String &id) {
+  if (id.length() < 2 || id[0] < 'A' || id[0] > 'Z') return -1;
+  for (size_t i = 1; i < id.length(); i++)
+    if (!isdigit((unsigned char)id[i])) return -1;
+  return id[0] - 'A';
+}
+
+// ---- alert batches ----------------------------------------------------
+//
+// Each heartbeat board watches a different supply, so several going down in
+// the same minute is common (one breaker, one storm) and each one matters.
+// The nodes that go stale in the same check share one Discord message -- one
+// notification listing them all -- and that message is re-sent, acknowledged
+// and muted as a unit. A node that fails later starts a batch of its own, so
+// a fresh failure is never hidden inside an alert already ticked.
+struct Batch {
+  bool inUse = false;
+  String msgId;          // last message posted, polled for the tick
+  time_t episodeAt = 0;  // when this round of alerting began
+  time_t lastSent = 0, ackedAt = 0, lastTry = 0;
+  int sent = 0;          // posts this episode, shown as "第 N 次提醒"
+  int calls = 0;         // phone rounds this episode
+  uint32_t failures = 0; // consecutive failed posts, drives the backoff
+};
+static const int MAX_BATCHES = 12;
+static Batch batches[MAX_BATCHES];
+static time_t lastPhoneAt = 0;
+
+static int batchOpen(time_t now) {
+  for (int i = 0; i < MAX_BATCHES; i++)
+    if (!batches[i].inUse) {
+      batches[i] = Batch();
+      batches[i].inUse = true;
+      batches[i].episodeAt = now;
+      return i;
+    }
+  // All in use: fold into the newest rather than leave the node unreported.
+  int newest = 0;
+  for (int i = 1; i < MAX_BATCHES; i++)
+    if (batches[i].episodeAt > batches[newest].episodeAt) newest = i;
+  return newest;
+}
+
+static int batchMembers(int b) {
+  int n = 0;
+  for (int i = 0; i < MAX_NODES; i++)
+    if (nodeStates[i].inUse && nodeStates[i].alertActive &&
+        nodeStates[i].batch == b)
+      n++;
+  return n;
+}
+
+// The message for one batch. One node reads like the old per-node alert; more
+// get a line each. Renders e.g.:
+//   @owner ⚠️ **3 處失聯**：A01、A05、A06（第 2 次提醒）
+//   • A01（打氣機）最後回報 14:32，已中斷 9 分鐘
+//   ...
+//   ⚠️ 魚塭 A 全部 10 片都失聯 → 比較可能是網路問題
+//   10 分鐘內沒人確認會撥電話
+//   點 ✅ 回報已知悉（靜音 60 分鐘）
+static String alertText(int b, time_t now) {
+  const Batch &B = batches[b];
+  String list;
+  int n = 0;
+  NodeState *only = nullptr;
+  bool sitesHit[26] = {false};
+  for (int i = 0; i < MAX_NODES; i++) {
+    NodeState &ns = nodeStates[i];
+    if (!ns.inUse || !ns.alertActive || ns.batch != b) continue;
+    if (n++) list += "、";
+    list += jsonEscape(ns.id);
+    only = &ns;
+    int s = siteIndex(ns.id);
+    if (s >= 0) sitesHit[s] = true;
   }
 
-  // An acknowledged alert stays quiet only for the mute window: a node that
-  // is still dead an hour later has to speak up again.
-  if (st.ackedAt) {
-    if ((uint32_t)(now - st.ackedAt) < ACK_MUTE_S) return;
-    logLine("%s mute expired, resuming alerts", id.c_str());
-    st.ackedAt = 0;
-    st.lastSent = 0;
-    st.episodeAt = 0;  // a fresh episode: the phone waits its turn again
-  }
+  String c = "<@" + String(DISCORD_USER_ID) + "> ⚠️ **";
+  c += (n == 1) ? jsonEscape(only->id) + " 失聯**"
+                : String(n) + " 處失聯**：" + list;
+  if (B.sent > 0) c += "（第 " + String(B.sent + 1) + " 次提醒）";
+  c += "\\n";
 
-  // The phone, once the episode has gone NOTIFIES_BEFORE_CALL renotify
-  // periods without a tick. Ahead of the Discord pacing below so it is not
-  // skipped by that early return.
-  if (!st.episodeAt) {
-    st.episodeAt = now;
-    st.calls = 0;
-    st.lastCallAt = 0;
-  }
-  time_t callFrom = st.episodeAt + NOTIFIES_BEFORE_CALL * RENOTIFY_S;
-  if (now >= callFrom && st.calls < CALL_MAX &&
-      (!st.lastCallAt || (uint32_t)(now - st.lastCallAt) >= CALL_REPEAT_S)) {
-    st.calls++;
-    st.lastCallAt = now;
-    logLine("%s unacknowledged for %lus, phoning (round %d)", id.c_str(),
-            (unsigned long)(now - st.episodeAt), st.calls);
-    airDial(id, staleFor / 60);
-  }
-
-  if (st.lastSent && (uint32_t)(now - st.lastSent) < RENOTIFY_S) return;
-
-  // Back off after failures. RENOTIFY_S only paces *successful* posts, because
-  // lastSent is set on success -- so while Discord is unreachable (an outage,
-  // a bad token, a deleted channel) every cycle retried, once a minute, each
-  // one a failing TLS round-trip that slows the whole loop down. That is worst
-  // exactly when a node is down and an update might be needed. Double the wait
-  // per consecutive failure, capped.
-  if (st.failures) {
-    uint32_t wait = RENOTIFY_S << (st.failures - 1 < 4 ? st.failures - 1 : 4);
-    if ((uint32_t)(now - st.lastTry) < wait) return;
-  }
-  st.lastTry = now;
-
-  // "超過 %d 分鐘未回報" -- exceeded N minutes without reporting
-  String reason = "\\u8d85\\u904e " + humanDuration(staleFor) +
-                  "\\u672a\\u56de\\u5831";
-  int callInMin =
-      callFrom > now ? (int)((callFrom - now + 59) / 60) : 0;
-  String msgId =
-      discordNotify(id, reason, staleFor, lastSeen, lastReading,
-                    st.sentCount + 1, st.calls, callInMin);
-  if (msgId.length()) {
-    st.msgId = msgId;
-    st.lastSent = now;
-    st.sentCount++;
-    st.failures = 0;
-    notifySent++;
-    logLine("discord notified for %s (msg %s, #%d)", id.c_str(),
-            msgId.c_str(), st.sentCount);
+  if (n == 1) {
+    if (only->note.length()) c += "說明：" + jsonEscape(only->note) + "\\n";
+    c += "最後回報：" + localHhMm(only->lastSeen) + "\\n";
+    c += "已中斷：" + humanDuration(only->age) + "\\n";
+    if (only->reading.length()) c += "最後讀值：" + only->reading + "\\n";
   } else {
-    st.failures++;
-    logLine("discord notify FAILED for %s (#%lu), next try in %lus",
-            id.c_str(), (unsigned long)st.failures,
-            (unsigned long)(RENOTIFY_S
-                            << (st.failures - 1 < 4 ? st.failures - 1 : 4)));
+    for (int i = 0; i < MAX_NODES; i++) {
+      NodeState &ns = nodeStates[i];
+      if (!ns.inUse || !ns.alertActive || ns.batch != b) continue;
+      c += "• " + jsonEscape(ns.id);
+      if (ns.note.length()) c += "（" + jsonEscape(ns.note) + "）";
+      c += " 最後回報 " + localHhMm(ns.lastSeen) + "，已中斷 " +
+           humanDuration(ns.age) + "\\n";
+    }
   }
+
+  for (int s = 0; s < 26; s++)
+    if (sitesHit[s] && siteTotal[s] >= 2 && siteStale[s] == siteTotal[s])
+      c += "⚠️ 魚塭 " + String((char)('A' + s)) + " 全部 " +
+           String(siteTotal[s]) + " 片都失聯 → 比較可能是網路問題\\n";
+
+  time_t callFrom = B.episodeAt + NOTIFIES_BEFORE_CALL * RENOTIFY_S;
+  if (B.calls > 0)
+    c += "已撥電話：" + String(B.calls) + " 次\\n";
+  else if (callFrom > now)
+    c += String((int)((callFrom - now + 59) / 60)) + " 分鐘內沒人確認會撥電話\\n";
+
+  c += "點 ✅ 回報已知悉（靜音 " + String(ACK_MUTE_S / 60) + " 分鐘）";
+  return c;
+}
+
+// Runs every check: acknowledgements, the phone, then Discord, per batch.
+static void driveBatches(time_t now) {
+  // Close batches whose nodes have all recovered.
+  for (int b = 0; b < MAX_BATCHES; b++)
+    if (batches[b].inUse && !batchMembers(b)) batches[b].inUse = false;
+
+  // Acknowledgements and mute expiry.
+  for (int b = 0; b < MAX_BATCHES; b++) {
+    Batch &B = batches[b];
+    if (!B.inUse) continue;
+    if (B.msgId.length() && !B.ackedAt && discordAcked(B.msgId)) {
+      B.ackedAt = now;
+      notifyAcked++;
+      logLine("batch %d acknowledged, muting %lu min", b,
+              (unsigned long)(ACK_MUTE_S / 60));
+      for (int i = 0; i < MAX_NODES; i++) {
+        NodeState &ns = nodeStates[i];
+        if (ns.inUse && ns.alertActive && ns.batch == b)
+          rtdbRequest("PATCH", "/alerts/" + ns.id + ".json",
+                      "{\"acked\":true,\"ackedAt\":" + String((uint32_t)now) + "}",
+                      nullptr);
+      }
+    }
+    // An acknowledged alert stays quiet only for the mute window: a node still
+    // dead an hour later has to speak up again, and the phone waits its turn
+    // again from there.
+    if (B.ackedAt && (uint32_t)(now - B.ackedAt) >= ACK_MUTE_S) {
+      logLine("batch %d mute expired, resuming", b);
+      B.ackedAt = 0;
+      B.lastSent = 0;
+      B.episodeAt = now;
+      B.calls = 0;
+    }
+  }
+
+  // The phone: one call however many batches are waiting. It is only there to
+  // wake someone up; what failed is in Discord. Keyed to time, not to how
+  // many posts succeeded, so a Discord outage cannot hold it back.
+  bool due = false;
+  for (int b = 0; b < MAX_BATCHES; b++) {
+    const Batch &B = batches[b];
+    if (B.inUse && !B.ackedAt && B.calls < CALL_MAX &&
+        now >= B.episodeAt + NOTIFIES_BEFORE_CALL * RENOTIFY_S)
+      due = true;
+  }
+  if (due && (!lastPhoneAt || (uint32_t)(now - lastPhoneAt) >= CALL_REPEAT_S)) {
+    lastPhoneAt = now;
+    for (int b = 0; b < MAX_BATCHES; b++) {
+      Batch &B = batches[b];
+      if (B.inUse && !B.ackedAt && B.calls < CALL_MAX &&
+          now >= B.episodeAt + NOTIFIES_BEFORE_CALL * RENOTIFY_S)
+        B.calls++;
+    }
+    logLine("unacknowledged alerts, phoning");
+    // No node in the call: the module then just says "鱼塘监控警报". Which
+    // supply failed is for Discord.
+    airDial("", 0);
+  }
+
+  // Discord, paced per batch and backed off after failures (doubling, capped
+  // at 16x) so an unreachable Discord does not cost a failing TLS round trip
+  // every minute.
+  for (int b = 0; b < MAX_BATCHES; b++) {
+    Batch &B = batches[b];
+    if (!B.inUse || B.ackedAt) continue;
+    if (B.lastSent && (uint32_t)(now - B.lastSent) < RENOTIFY_S) continue;
+    if (B.failures) {
+      uint32_t wait = RENOTIFY_S << (B.failures - 1 < 4 ? B.failures - 1 : 4);
+      if ((uint32_t)(now - B.lastTry) < wait) continue;
+    }
+    B.lastTry = now;
+    String msgId = postAlert(alertText(b, now));
+    if (msgId.length()) {
+      B.msgId = msgId;
+      B.lastSent = now;
+      B.sent++;
+      B.failures = 0;
+      notifySent++;
+      logLine("batch %d notified (%d nodes, #%d)", b, batchMembers(b), B.sent);
+    } else {
+      B.failures++;
+      logLine("batch %d notify FAILED (#%lu)", b, (unsigned long)B.failures);
+    }
+  }
+}
+
+static int batchesOpen() {
+  int n = 0;
+  for (int b = 0; b < MAX_BATCHES; b++) n += batches[b].inUse;
+  return n;
+}
+
+// ---- first sighting -----------------------------------------------------
+//
+// Each node is announced once, the first time it is seen alive -- so wiring up
+// twenty boards on the bench reports itself board by board, and a board that
+// was never registered (it publishes as esp-<mac>) is pointed out. Who has
+// been announced is kept in NVS, or every reboot of this board would announce
+// every node again. The very first run after this was added adopts whatever
+// already exists without a word.
+static Preferences seenPrefs;
+static String seenIds;  // ",A01,A05,pond-site,"
+static bool seenLoaded = false, seenSeeding = false, seenDirty = false;
+
+static void seenLoad() {
+  if (seenLoaded) return;
+  seenLoaded = true;
+  seenPrefs.begin("seen", true);
+  seenSeeding = !seenPrefs.isKey("ids");
+  seenIds = seenPrefs.getString("ids", ",");
+  seenPrefs.end();
+}
+
+// Returns true when `id` has not been seen before (and records it).
+static bool seenFirst(const String &id) {
+  seenLoad();
+  String key = "," + id + ",";
+  if (seenIds.indexOf(key) >= 0) return false;
+  seenIds += id + ",";
+  seenDirty = true;
+  return !seenSeeding;
+}
+
+static void seenSave() {
+  if (!seenDirty) return;
+  seenDirty = false;
+  seenSeeding = false;
+  seenPrefs.begin("seen", false);
+  seenPrefs.putString("ids", seenIds);
+  seenPrefs.end();
 }
 
 // Defined further down with the rest of the Discord helpers; needed here
@@ -1327,7 +1451,7 @@ static void announceNodeMove(const String &id, const String &obj,
   String ssid, ip;
   if (!extractString(obj, 0, "ssid", &ssid) || !ssid.length()) return;
 
-  NotifyState &ns = notifyState(id);
+  NodeState &ns = nodeState(id);
 
   // First sighting: adopt whatever it says without announcing. Otherwise every
   // reboot of this device would re-announce every node.
@@ -1369,7 +1493,12 @@ static void runCheck() {
 
   time_t now = time(nullptr);
   int stale = 0, healthy = 0;
-  String summary;
+  String summary, recovered, firsts;
+  int recoveredCount = 0;
+  int newBatch = -1;  // opened lazily, for the nodes that go stale this check
+  memset(siteTotal, 0, sizeof(siteTotal));
+  memset(siteStale, 0, sizeof(siteStale));
+  for (int i = 0; i < MAX_NODES; i++) nodeStates[i].seenThisCheck = false;
 
   // Walk the top-level device ids. Each looks like  "pond-site":{...}
   int pos = 1;  // skip the opening brace
@@ -1380,12 +1509,8 @@ static void runCheck() {
     if (q2 < 0) break;
     String id = json.substring(q1 + 1, q2);
 
-    // The device's own object ends where the next top-level id begins; using
-    // the whole remainder as the search window is fine because the fields we
-    // read appear before it.
     int objStart = json.indexOf('{', q2);
     if (objStart < 0) break;
-
     // Find the matching close brace to bound this device's fields.
     int depth = 0, objEnd = objStart;
     for (int i = objStart; i < (int)json.length(); i++) {
@@ -1408,68 +1533,116 @@ static void runCheck() {
     uint32_t age = (now > (time_t)ts) ? (uint32_t)(now - (time_t)ts) : 0;
     uint32_t limit = (uint32_t)interval * STALE_MULTIPLE;
     bool isStale = age > limit;
-
     summary += id + "=" + String(age) + "s" + (isStale ? "(STALE) " : "(ok) ");
 
-    // A node that is publishing happily but from an unexpected network has not
-    // failed -- it has been carried somewhere, which is the recovery plan for
-    // a board that stopped working. Nobody would otherwise be told: it is not
-    // stale, so no alert fires, and only this device has both the ssid the
-    // node reports and a way to say anything on Discord. The other nodes have
-    // no Discord credentials at all, which is why this is announced on their
-    // behalf rather than by them.
+    NodeState &ns = nodeState(id);
+    ns.seenThisCheck = true;
+    ns.age = age;
+    ns.note = "";
+    extractString(obj, 0, "note", &ns.note);
+    // Surface whatever the node last measured; a heartbeat board has nothing.
+    ns.reading = "";
+    double temp;
+    if (extractNumber(obj, 0, "temp", &temp))
+      ns.reading = String(temp, 1) + " \\u00b0C";
+
+    int site = siteIndex(id);
+    if (site >= 0) {
+      siteTotal[site]++;
+      if (isStale) siteStale[site]++;
+    }
+
+    // A node publishing happily from an unexpected network has been carried
+    // somewhere -- see announceNodeMove.
     announceNodeMove(id, obj, isStale);
+
+    // First time this node has ever been seen alive.
+    if (!isStale && seenFirst(id)) {
+      String ssid, mac;
+      double rssi = 0;
+      extractString(obj, 0, "ssid", &ssid);
+      extractString(obj, 0, "mac", &mac);
+      bool hasRssi = extractNumber(obj, 0, "rssi", &rssi);
+      if (id.startsWith("esp-")) {
+        firsts += "❓ **發現未登記的板子**：" + jsonEscape(id) + "\\n";
+        if (mac.length()) firsts += "MAC：" + jsonEscape(mac) + "\\n";
+        firsts += "請用 tools/register.sh <編號> <COM埠> --no-flash 登記\\n";
+      } else {
+        firsts += "🆕 **" + jsonEscape(id) + " 首次上線**";
+        if (ns.note.length()) firsts += "（" + jsonEscape(ns.note) + "）";
+        firsts += "\\n";
+        if (ssid.length()) {
+          firsts += "WiFi：" + jsonEscape(ssid);
+          if (hasRssi) firsts += "，訊號 " + String((int)rssi) + " dBm";
+          firsts += "\\n";
+        }
+      }
+      logLine("%s seen for the first time", id.c_str());
+    }
 
     // Transition detection uses state this device already holds, rather than
     // re-fetching /alerts/<id>/active every minute: each such fetch was a full
-    // TLS handshake (tens of KB of heap) to re-read a boolean we wrote
-    // ourselves. Cutting them removes most of the per-check allocation churn,
-    // which is the suspected cause of the hang this firmware recovers from.
-    // Cost of keeping it local: after a reboot the first check re-raises an
-    // alert that was already active, which errs toward notifying.
-    NotifyState &ns = notifyState(id);
-    bool wasActive = ns.alertActive;
-
-    if (isStale && !wasActive) {
+    // TLS handshake to re-read a boolean we wrote ourselves.
+    if (isStale && !ns.alertActive) {
       String reason = "no publish for " + String(age) + "s (limit " +
                       String(limit) + "s)";
       if (writeAlert(id, true, (time_t)ts, reason)) {
         alertsRaised++;
         ns.alertActive = true;
-        logLine("ALERT RAISED %s: %s", id.c_str(), reason.c_str());
+        ns.lastSeen = (time_t)ts;
+        if (newBatch < 0) newBatch = batchOpen(now);
+        ns.batch = newBatch;
+        logLine("ALERT RAISED %s: %s (batch %d)", id.c_str(), reason.c_str(),
+                newBatch);
       } else {
         logLine("failed to raise alert for %s: %s", id.c_str(),
                 lastError.c_str());
       }
-      ns.reset();
-    } else if (!isStale && wasActive) {
+    } else if (!isStale && ns.alertActive) {
       if (writeAlert(id, false, (time_t)ts, "publishing again")) {
         alertsCleared++;
         ns.alertActive = false;
-        logLine("alert cleared %s (age %lus)", id.c_str(),
-                (unsigned long)age);
+        ns.batch = -1;
+        // How long it was down: from its last beat before going quiet to the
+        // first one back.
+        uint32_t down = (ns.lastSeen && (time_t)ts > ns.lastSeen)
+                            ? (uint32_t)((time_t)ts - ns.lastSeen) : 0;
+        recovered += "✅ **" + jsonEscape(id) + " 恢復**";
+        if (ns.note.length()) recovered += "（" + jsonEscape(ns.note) + "）";
+        if (down) recovered += "，中斷 " + humanDuration(down);
+        recovered += "\\n";
+        recoveredCount++;
+        logLine("alert cleared %s (down %lus)", id.c_str(), (unsigned long)down);
       }
-      ns.reset();
-    }
-
-    if (isStale) {
-      // Surface whatever the node last measured. Read from meta.sensors so a
-      // node with different sensors needs no change here.
-      String reading;
-      double temp;
-      if (extractNumber(obj, 0, "temp", &temp))
-        reading = String(temp, 1) + " \\u00b0C";
-      driveNotifications(id, age, (time_t)ts, reading);
     }
 
     if (isStale) stale++; else healthy++;
   }
 
+  // A node deleted from /devices while alerting can never recover; drop it so
+  // its batch can close.
+  for (int i = 0; i < MAX_NODES; i++) {
+    NodeState &ns = nodeStates[i];
+    if (ns.inUse && !ns.seenThisCheck && ns.alertActive) {
+      ns.alertActive = false;
+      ns.batch = -1;
+      logLine("%s no longer in /devices, dropped", ns.id.c_str());
+    }
+  }
+
+  // Said without a mention: good news and new boards do not need to buzz
+  // anyone's phone.
+  if (recoveredCount) discordSay(recovered);
+  if (firsts.length()) discordSay(firsts);
+  seenSave();
+
+  driveBatches(now);
+
   anyAlertActive = (stale > 0);
   lastSummary = summary.length() ? summary : "no other devices found";
-  logLine("check: %d ok, %d stale | heap=%u blk=%u | %s", healthy, stale,
-          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
-          lastSummary.c_str());
+  logLine("check: %d ok, %d stale, %d batches | heap=%u blk=%u | %s", healthy,
+          stale, batchesOpen(), (unsigned)ESP.getFreeHeap(),
+          (unsigned)ESP.getMaxAllocHeap(), lastSummary.c_str());
 }
 
 // Its own heartbeat, so a future node C can watch this watchdog in turn.
@@ -1567,7 +1740,7 @@ static String htmlEscape(const String &in) {
 // reboot is how a channel gets muted.
 //
 // The alert path is the opposite case and keeps its mention: nobody is
-// watching when a pond node goes quiet at 3am. See discordNotify().
+// watching when a pond node goes quiet at 3am. See alertText().
 //
 // `content` is JSON string source, not plain text: callers build it with
 // \uXXXX escapes and run jsonEscape() over anything interpolated.
@@ -1860,6 +2033,7 @@ static void handleRoot() {
   b += "alert active now: " + String(anyAlertActive ? "YES" : "no") + "\n";
   b += "discord sent: " + String(notifySent) + "\n";
   b += "discord acked: " + String(notifyAcked) + "\n";
+  b += "alert batches open: " + String(batchesOpen()) + "\n";
   b += "bot id: " + (botUserId.length() ? botUserId : String("UNKNOWN")) + "\n";
   b += "dialer: " + String(airHealthy() ? "ok" : "NOT OK") + "  csq=" +
        String(air.csq) + " reg=" + String(air.reg) + " ims=" + String(air.ims);
@@ -1981,9 +2155,12 @@ static void handleTestCall() {
 }
 
 static void handleTestAlert() {
-  // "手動測試" -- manual test
-  String msgId = discordNotify("TEST", "\\u624b\\u52d5\\u6e2c\\u8a66", 0,
-                               time(nullptr), "28.0 \\u00b0C", 1, 0, 0);
+  // Shaped like a real single-node alert, so the path a real one takes --
+  // post, pre-seeded tick, then /testack -- can be checked end to end.
+  String msgId = postAlert("<@" + String(DISCORD_USER_ID) +
+                           "> ⚠️ **TEST 失聯**（手動測試）\\n"
+                           "點 ✅ 回報已知悉（靜音 " + String(ACK_MUTE_S / 60) +
+                           " 分鐘）");
   if (!msgId.length()) {
     server.send(500, "text/plain", "discord post failed: " + lastError + "\n");
     return;
