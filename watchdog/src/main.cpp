@@ -52,10 +52,10 @@ static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b49-2026.10.10";
+static const char *FW_VERSION = "b50-2026.10.14";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 49;
+static const uint32_t FW_VERSION_CODE = 50;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -906,6 +906,38 @@ static bool writeAlert(const String &id, bool active, time_t lastSeen,
   return rtdbRequest("PATCH", "/alerts/" + id + ".json", body, nullptr);
 }
 
+// /alerts/<id> holds only the latest episode; this keeps every one, for
+// statistics read by other sites. Keyed by the last heartbeat before going
+// quiet, so the re-raise after this board reboots lands on the same record
+// instead of counting the outage twice. Best-effort: a failure costs a row of
+// history, never the alert itself.
+static void writeOutage(const String &id, time_t start, bool active,
+                        time_t end, const String &reason) {
+  if (!start) return;  // never published: there is no start to key on
+  time_t now = time(nullptr);
+  String path = "/outages/" + id + "/" + String((uint32_t)start);
+  // A heartbeat board writes its own end -- its first beat back, exactly --
+  // while ours is whatever latest.ts read at the next check, up to a beat
+  // later. One extra read, on recoveries only, to not overwrite the better one.
+  String boardEnd;
+  if (!active && rtdbRequest("GET", path + "/end.json", "", &boardEnd) &&
+      boardEnd != "null")
+    end = 0;
+  String body = "{";
+  body += "\"start\":" + String((uint32_t)start);
+  body += ",\"active\":" + String(active ? "true" : "false");
+  if (active) {
+    body += ",\"detectedAt\":" + String((uint32_t)now);
+    body += ",\"reason\":\"" + reason + "\"";
+  } else if (end) {
+    body += ",\"end\":" + String((uint32_t)end);
+    body += ",\"dur\":" + String((uint32_t)(end > start ? end - start : 0));
+  }
+  body += "}";
+  if (!rtdbRequest("PATCH", path + ".json", body, nullptr))
+    logLine("outage record FAILED for %s: %s", id.c_str(), lastError.c_str());
+}
+
 // ---- phone: the Air724UG dialer ---------------------------------------
 //
 // A Discord mention at 3am is easy to sleep through, so an alert nobody has
@@ -1609,6 +1641,7 @@ static void runCheck() {
         alertsRaised++;
         ns.alertActive = true;
         ns.lastSeen = (time_t)ts;
+        writeOutage(id, ns.lastSeen, true, 0, reason);
         if (newBatch < 0) newBatch = batchOpen(now);
         ns.batch = newBatch;
         logLine("ALERT RAISED %s: %s (batch %d)", id.c_str(), reason.c_str(),
@@ -1626,6 +1659,7 @@ static void runCheck() {
         // first one back.
         uint32_t down = (ns.lastSeen && (time_t)ts > ns.lastSeen)
                             ? (uint32_t)((time_t)ts - ns.lastSeen) : 0;
+        writeOutage(id, ns.lastSeen, false, (time_t)ts, "");
         recovered += "✅ **" + jsonEscape(id) + " 恢復**";
         if (ns.note.length()) recovered += "（" + jsonEscape(ns.note) + "）";
         if (down) recovered += "，中斷 " + humanDuration(down);

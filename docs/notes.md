@@ -49,7 +49,43 @@ history/pond-site/2026-08/
     <unix_ts>: { temp, humid }            # 每 5 分鐘一筆，按月分片
 alerts/pond-site/
     { active, acked, ackedAt, firedAt, clearedAt, lastSeen, reason, by }
+                                          # 只有最近一次，每次覆寫
+outages/A01/
+    <start>: { start, end, dur, active,              # 共用
+               cause, detail, reset, rssi, fw,       # 心跳板自己寫
+               detectedAt, reason }                  # watchdog 寫
+                                          # 每次停跳一筆，不覆寫，給統計用
 ```
+
+每次停跳一筆。key 和 `start` 都是停跳前最後一次成功的心跳（unix 秒，也就是
+當時的 `latest.ts`），所以心跳板和 watchdog 寫的是同一筆、欄位合併：
+
+- **watchdog**：超過 `interval × 5` 判定失聯時開一筆 `active:true`；恢復時
+  改 `active:false`。只有心跳板還沒寫 `end` 時才補 `end`/`dur`。
+- **心跳板**：恢復後第一次心跳成功時上傳 `end`、`dur`（秒）、`cause`、
+  `detail`。停跳期間記在 NVS，斷電重開也不會遺失；不受 watchdog 是否在線影響，
+  5 分鐘以下的短停跳也有。
+
+`cause`：
+
+| 值 | 意思 | `detail` |
+|---|---|---|
+| `power` | 斷電（POWERON） | |
+| `brownout` | 電壓不穩 | |
+| `crash` | 當機重開 | |
+| `reboot` | 自己重開（更新等）；少於 2 次心跳間隔不記 | |
+| `wifi` | 板子有電，WiFi 斷了 | 斷線原因，例如「收不到基地台訊號 (200)」 |
+| `internet` | WiFi 在，DNS 查不到（魚塭對外網路斷） | |
+| `cloud` | 網路在，RTDB 拒絕或逾時 | HTTP 錯誤 |
+
+`reset` 是停跳期間第一次重開機的原因；`rssi` 是停跳前最後的訊號強度。
+
+網站：次數 = 子節點數；`active:true` 表示還沒恢復（已停 = 現在 − start）；
+沒有 `cause` 的是 watchdog 單方面的紀錄（板子還沒回來，或不是心跳板，
+例如 pond-site）。一次 `wifi` 停跳最短 2 分鐘（漏一次心跳），可依 `dur` 過濾。
+
+限制：板子在 watchdog 停機期間恢復，watchdog 開的那筆仍會停在
+`active:true`，但若是心跳板，它自己會把 `active` 改成 `false`。
 
 裝置 ID 綁定**監測目標**而非硬體（`pond-site` 而非 `esp32-a`），
 換板子時歷史資料保持連續。

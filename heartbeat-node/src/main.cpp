@@ -14,6 +14,7 @@
 //   /devices/<id>/latest   {ts, ssid, ip, rssi, up}   every minute
 //   /devices/<id>/meta     {name, role, group, interval, mac, ...}   per boot
 //   /incidents/<id>/<ts>   how the previous run ended, when it is worth saying
+//   /outages/<id>/<start>  every stretch the heartbeat stopped, and why
 //
 // Built with flash_mode dio and a 4MB partition table on purpose: one
 // watchdog board misread flash under qio (see the handoff), and checking
@@ -42,10 +43,10 @@ static void siteWifiWaitTick();
 
 // ---- configuration ----------------------------------------------------
 static const char *FW_GROUP = "heartbeat";
-static const char *FW_VERSION = "h1-2026.10.10";
+static const char *FW_VERSION = "h2-2026.10.14";
 // Monotonic; /firmware/<group>/version is compared against this. Bump on
 // every release.
-static const uint32_t FW_VERSION_CODE = 1;
+static const uint32_t FW_VERSION_CODE = 2;
 
 // The onboard RGB. GPIO48 on the DevKitC-1 v1.0 layout these boards follow;
 // v1.1 boards moved it to GPIO38, so a dark LED on a new batch means look here
@@ -197,8 +198,11 @@ static bool rtdb(const char *method, const String &path, const String &body) {
 // actually is; rssi is the early warning for a supply placed too far from the
 // AP. No "ts" anywhere else under /devices/<id>: the watchdog takes the first
 // "ts" it finds there as the heartbeat.
-static bool publishBeat() {
+// ts is handed back so the outage record can key on exactly the value the
+// watchdog will read as latest.ts.
+static bool publishBeat(uint32_t &ts) {
   time_t now = time(nullptr);
+  ts = (uint32_t)now;
   String body = "{\"ts\":" + String((uint32_t)now);
   body += ",\"ssid\":\"" + jsonEscape(connectedSsid) + "\"";
   body += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
@@ -232,10 +236,9 @@ static bool publishMeta() {
 // ended, and uploads it once there is a network. For a heartbeat board this
 // is directly useful -- a POWERON whose last beat was seconds ago is exactly
 // the supply cut it exists to detect, recorded from the board's own side.
-// Written only from boot and at most once a minute, so flash wear is a
+// Written only from boot and once per beat (a minute), so flash wear is a
 // non-issue.
 static Preferences incPrefs;
-static uint32_t lastBeatWrite = 0;
 
 struct PrevRun {
   bool present;
@@ -254,13 +257,12 @@ static void incidentBegin() {
   incPrefs.end();
 }
 
-static void incidentHeartbeat() {
-  time_t now = time(nullptr);
-  if (now < 1600000000) return;
-  if (lastBeatWrite && millis() - lastBeatWrite < 60000) return;
-  lastBeatWrite = millis();
+// The ts of the beat that just got through, not the time now: an outage that
+// follows starts at this value, and the watchdog keys the same outage on it.
+static void incidentHeartbeat(uint32_t beatTs) {
+  if (beatTs < 1600000000) return;
   incPrefs.begin("inc", false);
-  incPrefs.putUInt("beat", (uint32_t)now);
+  incPrefs.putUInt("beat", beatTs);
   incPrefs.putUInt("up", millis() / 1000);
   incPrefs.end();
 }
@@ -301,6 +303,174 @@ static void incidentReport() {
   logLine("incident %s: %s", ok ? "reported" : "report FAILED", reset);
 }
 
+// ---- outage record ------------------------------------------------------
+// Every stretch the heartbeat stopped, from the board's own side: the last
+// beat that got through, the next one that did, and why. It goes to
+// /outages/<id>/<start>, the record the watchdog opens when it judges the
+// board stale -- start is the ts of the last beat, the very latest.ts the
+// watchdog keys on -- so the two halves merge into one row. The watchdog's
+// half says the board is down right now; this half says why, and covers what
+// the watchdog cannot see: gaps too short to be judged stale, and anything
+// that happened while the watchdog itself was down.
+//
+// Held in NVS from the moment it opens, because the outage is often a power
+// cut that ends this run. One write when it opens, one when it closes.
+//
+//   cause   power     POWERON: the supply went away
+//           brownout  the supply sagged
+//           crash     a hang or a panic
+//           reboot    our own restart (an update, a re-label)
+//           wifi      the board stayed up, WiFi dropped
+//           internet  WiFi up, but no name lookup: the pond's uplink
+//           cloud     internet up, RTDB refused or timed out
+static bool outagePending = false;
+static String outageCause;          // mirrors NVS "oc" while pending
+static uint32_t lastBeatTs = 0;     // ts of the last beat that got through
+static int lastBeatRssi = 0;
+
+// Set from the WiFi event task. Only the first drop after a connection counts:
+// the reconnect attempts that follow report their own, less telling reasons.
+static volatile bool wifiWasUp = false;
+static volatile uint8_t wifiDropReason = 0;
+
+static void wifiEventsBegin() {
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t) { wifiWasUp = true; },
+               ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent(
+      [](WiFiEvent_t, WiFiEventInfo_t info) {
+        if (!wifiWasUp) return;
+        wifiWasUp = false;
+        wifiDropReason = info.wifi_sta_disconnected.reason;
+      },
+      ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+}
+
+// Read on a website, so in words; the code stays in for anything unlisted.
+static String wifiDropName(uint8_t r) {
+  switch (r) {
+    case 200: return "收不到基地台訊號 (200)";             // BEACON_TIMEOUT
+    case 201: return "找不到基地台 (201)";                 // NO_AP_FOUND
+    case 2: case 15: case 202: case 204:
+      return "認證失敗 (" + String(r) + ")";               // password / handshake
+    case 8: return "主動斷線 (8)";                         // ASSOC_LEAVE
+    case 0: return "原因不明";
+    default: return "WiFi 斷線 (" + String(r) + ")";
+  }
+}
+
+static const char *causeFromReset(const char *reset) {
+  if (strstr(reset, "POWERON")) return "power";
+  if (strstr(reset, "BROWNOUT") || strstr(reset, "GLITCH")) return "brownout";
+  if (strstr(reset, "hang") || strstr(reset, "PANIC") || strstr(reset, "crash"))
+    return "crash";
+  return "reboot";
+}
+
+// Opens a record, or -- if one is already open -- refines a cause that only
+// said "reboot": a restart followed by a failed network is a network outage.
+static void outageOpen(uint32_t start, const String &cause,
+                       const String &detail, const char *reset, int rssi) {
+  if (outagePending && outageCause != "reboot") return;
+  if (!outagePending && start < 1600000000) return;  // no beat to start from
+  incPrefs.begin("inc", false);
+  if (!outagePending) {
+    incPrefs.putUInt("os", start);
+    if (reset) incPrefs.putString("or", reset);
+    if (rssi) incPrefs.putInt("orr", rssi);
+  }
+  incPrefs.putString("oc", cause);
+  incPrefs.putString("od", detail);
+  incPrefs.end();
+  outagePending = true;
+  outageCause = cause;
+  logLine("outage open: %s %s", cause.c_str(), detail.c_str());
+}
+
+// At boot: a run that ended mid-outage carries on with it; otherwise this boot
+// is itself the start of one, and the reset reason says why.
+static void outageAtBoot() {
+  const char *reset = resetReasonName();
+  incPrefs.begin("inc", false);
+  outagePending = incPrefs.getUInt("os", 0) != 0;
+  if (outagePending) {
+    outageCause = incPrefs.getString("oc", "");
+    // The first reboot inside the outage is the telling one; later ones are
+    // usually ours, giving up on WiFi.
+    if (!incPrefs.getString("or", "").length()) incPrefs.putString("or", reset);
+  }
+  incPrefs.end();
+  if (!outagePending && prevRun.lastBeat)
+    outageOpen(prevRun.lastBeat, causeFromReset(reset), "", reset, 0);
+}
+
+// A beat just failed while the board is running. Works out which link broke.
+static void outageOnFailure() {
+  if (outagePending && outageCause != "reboot") return;
+  String cause, detail;
+  if (WiFi.status() != WL_CONNECTED) {
+    cause = "wifi";
+    detail = wifiDropName(wifiDropReason);
+  } else {
+    IPAddress ip;
+    if (!WiFi.hostByName(RTDB_HOST, ip)) {
+      cause = "internet";
+      detail = "DNS 查詢失敗";
+    } else {
+      cause = "cloud";
+      detail = lastError;
+    }
+  }
+  outageOpen(lastBeatTs, cause, detail, nullptr, lastBeatRssi);
+}
+
+// A beat got through. Uploads the open record, if any, and clears it; on a
+// failed upload it stays in NVS -- end included -- and the next beat retries.
+static void outageOnSuccess(uint32_t beatTs) {
+  if (!outagePending || beatTs < 1600000000) return;
+  incPrefs.begin("inc", false);
+  uint32_t start = incPrefs.getUInt("os", 0);
+  uint32_t end = incPrefs.getUInt("oe", 0);
+  if (!end) {
+    end = beatTs;
+    incPrefs.putUInt("oe", end);
+  }
+  String cause = incPrefs.getString("oc", "");
+  String detail = incPrefs.getString("od", "");
+  String reset = incPrefs.getString("or", "");
+  int rssi = incPrefs.getInt("orr", 0);
+  incPrefs.end();
+
+  uint32_t dur = end > start ? end - start : 0;
+  // Our own restart is routine -- every update is one -- and only counts when
+  // it cost at least one missed beat. Everything else is recorded, however
+  // short: a 30-second power cut is exactly what these boards are for.
+  bool worth = cause != "reboot" || dur >= 2 * (PUBLISH_INTERVAL_MS / 1000);
+  if (worth && start) {
+    String body = "{\"start\":" + String(start);
+    body += ",\"end\":" + String(end);
+    body += ",\"dur\":" + String(dur);
+    body += ",\"active\":false";
+    body += ",\"cause\":\"" + cause + "\"";
+    if (detail.length()) body += ",\"detail\":\"" + jsonEscape(detail) + "\"";
+    if (reset.length()) body += ",\"reset\":\"" + jsonEscape(reset) + "\"";
+    if (rssi) body += ",\"rssi\":" + String(rssi);
+    body += ",\"fw\":" + String(FW_VERSION_CODE);
+    body += "}";
+    if (!rtdb("PATCH", "/outages/" + me.id + "/" + String(start) + ".json",
+              body)) {
+      logLine("outage upload FAILED: %s", lastError.c_str());
+      return;
+    }
+    logLine("outage recorded: %s %lus", cause.c_str(), (unsigned long)dur);
+  }
+
+  incPrefs.begin("inc", false);
+  for (const char *k : {"os", "oe", "oc", "od", "or", "orr"}) incPrefs.remove(k);
+  incPrefs.end();
+  outagePending = false;
+  outageCause = "";
+}
+
 // ---- http -------------------------------------------------------------
 static void handleRoot() {
   String b = "=== heartbeat " + me.id + " ===\n";
@@ -313,6 +483,7 @@ static void handleRoot() {
   b += "free heap: " + String(ESP.getFreeHeap()) + "\n\n";
   b += "publishes ok: " + String(publishOk) + ", failed: " + String(publishFail) + "\n";
   b += "last error: " + lastError + "\n";
+  if (outagePending) b += "outage open: " + outageCause + " (not yet uploaded)\n";
   b += "last reset: " + String(resetReasonName()) + "\n";
   b += "boot count: " + String(prevRun.bootCount + 1) + "\n";
   b += "fw: " + String(FW_VERSION) + " (v" + String(otaPullVersion()) +
@@ -335,6 +506,8 @@ static void handleFwCheck() {
 void setup() {
   blinkColor(BLUE, 2, 120);
   incidentBegin();
+  outageAtBoot();
+  wifiEventsBegin();
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
@@ -345,6 +518,10 @@ void setup() {
   uint32_t tries = 0;
   while (!connectWiFi()) {
     bootPasses = ++tries;
+    // A restart of our own that then cannot find a network is a WiFi outage;
+    // a power cut that cannot is still a power cut (outageOpen keeps it).
+    if (tries == 1)
+      outageOpen(prevRun.lastBeat, "wifi", "開機時連不上 WiFi", nullptr, 0);
     if (tries >= WIFI_BOOT_ATTEMPTS) {
       logLine("no wifi after %lu passes, rebooting", (unsigned long)tries);
       setLed(PURPLE);
@@ -408,17 +585,22 @@ void loop() {
   }
   nextPublish = millis() + PUBLISH_INTERVAL_MS;
 
-  if (publishBeat()) {
+  uint32_t beatTs;
+  if (publishBeat(beatTs)) {
     publishOk++;
     lastCycleOk = true;
     // A publish got through, so this image works: commit it and cancel the
     // rollback that would otherwise revert it on the next boot.
     otaMarkRunningFirmwareGood();
-    incidentHeartbeat();
+    outageOnSuccess(beatTs);
+    incidentHeartbeat(beatTs);
+    lastBeatTs = beatTs;
+    lastBeatRssi = WiFi.RSSI();
   } else {
     publishFail++;
     lastCycleOk = false;
     logLine("publish FAILED: %s", lastError.c_str());
+    outageOnFailure();
   }
 
   if ((int32_t)(millis() - nextPoll) >= 0) {
