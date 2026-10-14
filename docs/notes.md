@@ -266,6 +266,28 @@ pio run -e esp32-s3-devkitc-1 -t upload --upload-port COMx
    (響 25 秒,每 10 分鐘再撥,最多 3 次;同時有幾則告警都只撥一通)
 5. 確認後靜音 1 小時(電話也停)，**然後恢復通知** —— 已確認但未修復的魚塭不該永久靜音
 6. 節點恢復上傳 → 自動清除告警，保留 `firedAt` 以供追溯
+7. 在 Wang3697（開發用網路）上首次出現的板子不發「首次上線」，到魚塭才發
+
+### 告警開關（`alertControl/`，給網站寫）
+
+```
+alertControl/
+  groups/<群組id>: { members: {A01:true, A02:true}, enabled: false,
+                     until: 1792000000, note: "換馬達" }
+  nodes/<板子id>:  { enabled: true, until: ..., note: ... }
+```
+
+- `enabled:false` = 關告警：不發 Discord、不打電話、不發「恢復」訊息。
+  **斷線照樣偵測，`alerts/` 與 `outages/` 照記**，統計不會有缺口。
+- `until`（unix 秒）到了這筆就失效，回到預設（開）；不寫 = 永久。
+  過期的 entry watchdog 不會刪，網站自行清理或顯示「已過期」。
+- 優先順序：`nodes/<id>` > 所屬群組 > 預設開。一片板子只屬於一個群組
+  （網站防呆）；萬一兩個群組設定衝突，**開** 優先。
+- `members` 用 `{A01:true}`；陣列 `["A01","A02"]` 也接受。
+- watchdog 每次檢查（每分鐘）重讀，**最多 1 分鐘生效**。告警中被關 →
+  立刻停（排隊中的電話也取消）；被打開時仍斷線 → 立刻當新告警發。
+- 讀取失敗時沿用上一次讀到的設定；watchdog 開機後第一次讀到之前，全部開。
+- 被關的板子斷線時，watchdog 的紅燈與 `latest.alerting` 不算它。
 
 ## 已知限制
 

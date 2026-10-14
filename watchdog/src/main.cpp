@@ -29,6 +29,7 @@
 // between sites whose networks are not known in advance and nobody on site can
 // be asked to operate a tool. See the wifi section for the order and why.
 
+#include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include <Arduino.h>
 #include <esp_flash.h>
@@ -51,11 +52,15 @@
 static const int LED_PIN = 48;  // onboard WS2812
 
 static const char *DEVICE_ID = "watchdog";
+
+// The development bench's network. A node seen here is being flashed or
+// tested, so its first sighting is not announced -- see runCheck().
+static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b50-2026.10.14";
+static const char *FW_VERSION = "b51-2026.10.15";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 50;
+static const uint32_t FW_VERSION_CODE = 51;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -1181,6 +1186,7 @@ struct NodeState {
   bool alertActive = false;  // mirrors /alerts/<id>/active
   time_t lastSeen = 0;       // its last heartbeat, as of when it went stale
   int batch = -1;            // the alert batch it is listed in
+  bool muted = false;        // alerts switched off in /alertControl
   bool seenThisCheck = false;
   // Refreshed every check, for the alert text.
   uint32_t age = 0;
@@ -1231,6 +1237,67 @@ static int siteIndex(const String &id) {
   for (size_t i = 1; i < id.length(); i++)
     if (!isdigit((unsigned char)id[i])) return -1;
   return id[0] - 'A';
+}
+
+// ---- alert switches ---------------------------------------------------
+//
+// Which nodes may notify, set from the owner's website. Switched off, a node
+// is still watched and its outages still recorded in /alerts and /outages --
+// only Discord and the phone go quiet, so the statistics have no holes.
+//
+//   /alertControl/groups/<gid>  {members: {A01:true, ...}, enabled, until?, note?}
+//   /alertControl/nodes/<id>    {enabled, until?, note?}
+//
+// An entry counts until its "until" (unix seconds) passes; without one it
+// holds for good. A node's own entry beats its groups. The website keeps a
+// node in one group at most; should two disagree anyway, "on" wins -- a
+// missed outage costs more than a needless call. Anything unlisted is on.
+static JsonDocument alertCtl;
+
+// Re-read every check. On a failed read the last good copy stays in force;
+// before the first one, everything alerts.
+static void alertControlLoad() {
+  String body;
+  if (!rtdbRequest("GET", "/alertControl.json", "", &body)) {
+    logLine("alertControl read FAILED: %s", lastError.c_str());
+    return;
+  }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    logLine("alertControl parse FAILED: %s", err.c_str());
+    return;
+  }
+  alertCtl = std::move(doc);
+}
+
+static bool alertEntryLive(JsonVariantConst e, time_t now) {
+  if (!e["enabled"].is<bool>()) return false;
+  JsonVariantConst until = e["until"];
+  return until.isNull() || (uint32_t)now < until.as<uint32_t>();
+}
+
+// members is written as {A01:true}; a plain list is accepted too.
+static bool alertGroupHas(JsonVariantConst members, const String &id) {
+  if (members.is<JsonArrayConst>()) {
+    for (JsonVariantConst m : members.as<JsonArrayConst>())
+      if (id == m.as<const char *>()) return true;
+    return false;
+  }
+  return members[id].as<bool>();
+}
+
+static bool alertsEnabledFor(const String &id, time_t now) {
+  JsonVariantConst own = alertCtl["nodes"][id];
+  if (alertEntryLive(own, now)) return own["enabled"].as<bool>();
+  bool anyOn = false, anyOff = false;
+  for (JsonPairConst g : alertCtl["groups"].as<JsonObjectConst>()) {
+    JsonVariantConst e = g.value();
+    if (!alertEntryLive(e, now) || !alertGroupHas(e["members"], id)) continue;
+    if (e["enabled"].as<bool>()) anyOn = true;
+    else anyOff = true;
+  }
+  return anyOn || !anyOff;
 }
 
 // ---- alert batches ----------------------------------------------------
@@ -1542,8 +1609,10 @@ static void runCheck() {
     return;
   }
 
+  alertControlLoad();
+
   time_t now = time(nullptr);
-  int stale = 0, healthy = 0;
+  int stale = 0, healthy = 0, loud = 0;
   String summary, recovered, firsts;
   int recoveredCount = 0;
   int newBatch = -1;  // opened lazily, for the nodes that go stale this check
@@ -1608,10 +1677,14 @@ static void runCheck() {
     announceNodeMove(id, obj, isStale);
 
     // First time this node has ever been seen alive.
-    if (!isStale && seenFirst(id)) {
-      String ssid, mac;
+    // Not on the development bench, where boards are flashed and tested by
+    // the dozen: arriving at a pond is a board's real first time online. Not
+    // recorded as seen there either, so that arrival is still announced.
+    String ssid;
+    extractString(obj, 0, "ssid", &ssid);
+    if (!isStale && ssid != BENCH_SSID && seenFirst(id)) {
+      String mac;
       double rssi = 0;
-      extractString(obj, 0, "ssid", &ssid);
       extractString(obj, 0, "mac", &mac);
       bool hasRssi = extractNumber(obj, 0, "rssi", &rssi);
       if (id.startsWith("esp-")) {
@@ -1631,6 +1704,11 @@ static void runCheck() {
       logLine("%s seen for the first time", id.c_str());
     }
 
+    bool wasMuted = ns.muted;
+    ns.muted = !alertsEnabledFor(id, now);
+    if (ns.muted != wasMuted)
+      logLine("%s alerts switched %s", id.c_str(), ns.muted ? "off" : "on");
+
     // Transition detection uses state this device already holds, rather than
     // re-fetching /alerts/<id>/active every minute: each such fetch was a full
     // TLS handshake to re-read a boolean we wrote ourselves.
@@ -1642,10 +1720,14 @@ static void runCheck() {
         ns.alertActive = true;
         ns.lastSeen = (time_t)ts;
         writeOutage(id, ns.lastSeen, true, 0, reason);
-        if (newBatch < 0) newBatch = batchOpen(now);
-        ns.batch = newBatch;
-        logLine("ALERT RAISED %s: %s (batch %d)", id.c_str(), reason.c_str(),
-                newBatch);
+        // Switched off: recorded like any other, but in no batch, so nothing
+        // posts and nothing rings.
+        if (!ns.muted) {
+          if (newBatch < 0) newBatch = batchOpen(now);
+          ns.batch = newBatch;
+        }
+        logLine("ALERT RAISED %s: %s (batch %d%s)", id.c_str(), reason.c_str(),
+                ns.batch, ns.muted ? ", switched off" : "");
       } else {
         logLine("failed to raise alert for %s: %s", id.c_str(),
                 lastError.c_str());
@@ -1660,16 +1742,31 @@ static void runCheck() {
         uint32_t down = (ns.lastSeen && (time_t)ts > ns.lastSeen)
                             ? (uint32_t)((time_t)ts - ns.lastSeen) : 0;
         writeOutage(id, ns.lastSeen, false, (time_t)ts, "");
-        recovered += "✅ **" + jsonEscape(id) + " 恢復**";
-        if (ns.note.length()) recovered += "（" + jsonEscape(ns.note) + "）";
-        if (down) recovered += "，中斷 " + humanDuration(down);
-        recovered += "\\n";
-        recoveredCount++;
+        if (!ns.muted) {
+          recovered += "✅ **" + jsonEscape(id) + " 恢復**";
+          if (ns.note.length()) recovered += "（" + jsonEscape(ns.note) + "）";
+          if (down) recovered += "，中斷 " + humanDuration(down);
+          recovered += "\\n";
+          recoveredCount++;
+        }
         logLine("alert cleared %s (down %lus)", id.c_str(), (unsigned long)down);
       }
+    } else if (ns.alertActive && ns.muted && ns.batch >= 0) {
+      // Switched off mid-alert: out of its batch, which closes once empty --
+      // and with it any call still due.
+      ns.batch = -1;
+      logLine("%s switched off while alerting, dropped from its batch",
+              id.c_str());
+    } else if (ns.alertActive && !ns.muted && ns.batch < 0) {
+      // Switched back on while still down: speaks up now, as a fresh alert.
+      if (newBatch < 0) newBatch = batchOpen(now);
+      ns.batch = newBatch;
+      logLine("%s switched on while down, alerting (batch %d)", id.c_str(),
+              newBatch);
     }
 
     if (isStale) stale++; else healthy++;
+    if (isStale && !ns.muted) loud++;
   }
 
   // A node deleted from /devices while alerting can never recover; drop it so
@@ -1691,7 +1788,8 @@ static void runCheck() {
 
   driveBatches(now);
 
-  anyAlertActive = (stale > 0);
+  // Red LED and "alerting" only for what is actually allowed to alert.
+  anyAlertActive = (loud > 0);
   lastSummary = summary.length() ? summary : "no other devices found";
   logLine("check: %d ok, %d stale, %d batches | heap=%u blk=%u | %s", healthy,
           stale, batchesOpen(), (unsigned)ESP.getFreeHeap(),
@@ -2084,6 +2182,11 @@ static void handleRoot() {
   b += "alerts raised: " + String(alertsRaised) + "\n";
   b += "alerts cleared: " + String(alertsCleared) + "\n";
   b += "alert active now: " + String(anyAlertActive ? "YES" : "no") + "\n";
+  String muted;
+  for (int i = 0; i < MAX_NODES; i++)
+    if (nodeStates[i].inUse && nodeStates[i].muted)
+      muted += (muted.length() ? ", " : "") + nodeStates[i].id;
+  b += "alerts switched off: " + (muted.length() ? muted : String("none")) + "\n";
   b += "discord sent: " + String(notifySent) + "\n";
   b += "discord acked: " + String(notifyAcked) + "\n";
   b += "alert batches open: " + String(batchesOpen()) + "\n";
