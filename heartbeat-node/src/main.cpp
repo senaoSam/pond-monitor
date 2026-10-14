@@ -43,10 +43,10 @@ static void siteWifiWaitTick();
 
 // ---- configuration ----------------------------------------------------
 static const char *FW_GROUP = "heartbeat";
-static const char *FW_VERSION = "h2-2026.10.14";
+static const char *FW_VERSION = "h3-2026.10.15";
 // Monotonic; /firmware/<group>/version is compared against this. Bump on
 // every release.
-static const uint32_t FW_VERSION_CODE = 2;
+static const uint32_t FW_VERSION_CODE = 3;
 
 // The onboard RGB. GPIO48 on the DevKitC-1 v1.0 layout these boards follow;
 // v1.1 boards moved it to GPIO38, so a dark LED on a new batch means look here
@@ -309,9 +309,12 @@ static void incidentReport() {
 // /outages/<id>/<start>, the record the watchdog opens when it judges the
 // board stale -- start is the ts of the last beat, the very latest.ts the
 // watchdog keys on -- so the two halves merge into one row. The watchdog's
-// half says the board is down right now; this half says why, and covers what
-// the watchdog cannot see: gaps too short to be judged stale, and anything
-// that happened while the watchdog itself was down.
+// half says the board is down right now; this half says why, and covers
+// anything that happened while the watchdog itself was down.
+//
+// Only gaps the watchdog would alert on count: the ponds restart their
+// supplies on a schedule, and those short, expected gaps would bury the real
+// outages in the statistics.
 //
 // Held in NVS from the moment it opens, because the outage is often a power
 // cut that ends this run. One write when it opens, one when it closes.
@@ -323,6 +326,10 @@ static void incidentReport() {
 //           wifi      the board stayed up, WiFi dropped
 //           internet  WiFi up, but no name lookup: the pond's uplink
 //           cloud     internet up, RTDB refused or timed out
+// The watchdog's STALE_MULTIPLE: it alerts once a node has been silent for
+// more than this many of its intervals.
+static const uint32_t OUTAGE_MIN_S = 5 * (PUBLISH_INTERVAL_MS / 1000);
+
 static bool outagePending = false;
 static String outageCause;          // mirrors NVS "oc" while pending
 static uint32_t lastBeatTs = 0;     // ts of the last beat that got through
@@ -441,11 +448,9 @@ static void outageOnSuccess(uint32_t beatTs) {
   incPrefs.end();
 
   uint32_t dur = end > start ? end - start : 0;
-  // Our own restart is routine -- every update is one -- and only counts when
-  // it cost at least one missed beat. Everything else is recorded, however
-  // short: a 30-second power cut is exactly what these boards are for.
-  bool worth = cause != "reboot" || dur >= 2 * (PUBLISH_INTERVAL_MS / 1000);
-  if (worth && start) {
+  // The same test the watchdog applies (age > limit), so a gap is in the
+  // statistics exactly when it would have raised an alert.
+  if (dur > OUTAGE_MIN_S && start) {
     String body = "{\"start\":" + String(start);
     body += ",\"end\":" + String(end);
     body += ",\"dur\":" + String(dur);
