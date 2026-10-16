@@ -24,7 +24,6 @@
 
 #include <Arduino.h>
 #include <esp_task_wdt.h>
-#include <rom/rtc.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WebServer.h>
@@ -40,13 +39,14 @@ static void siteWifiWaitTick();
 #include "site_wifi.h"
 #include "registry.h"
 #include "pull_ota.h"
+#include "reset_reason.h"
 
 // ---- configuration ----------------------------------------------------
 static const char *FW_GROUP = "heartbeat";
-static const char *FW_VERSION = "h3-2026.10.15";
+static const char *FW_VERSION = "h4-2026.10.16";
 // Monotonic; /firmware/<group>/version is compared against this. Bump on
 // every release.
-static const uint32_t FW_VERSION_CODE = 3;
+static const uint32_t FW_VERSION_CODE = 4;
 
 // The onboard RGB. GPIO48 on the DevKitC-1 v1.0 layout these boards follow;
 // v1.1 boards moved it to GPIO38, so a dark LED on a new batch means look here
@@ -147,32 +147,6 @@ static String jsonEscape(const String &in) {
     o += (c == '"' || c == '\\' || c == '\n' || c == '\r') ? ' ' : c;
   }
   return o;
-}
-
-// RTC_SW_* is our own ESP.restart(), *WDT_* a hang, BROWNOUT a sagging supply.
-static const char *resetReasonName() {
-  switch (rtc_get_reset_reason(0)) {
-    case POWERON_RESET:          return "POWERON (power applied)";
-    case RTC_SW_CPU_RESET:       return "SW_CPU (our ESP.restart)";
-    case RTC_SW_SYS_RESET:       return "SW_SYS (our ESP.restart)";
-    case DEEPSLEEP_RESET:        return "DEEPSLEEP";
-    case TG0WDT_SYS_RESET:       return "TASK_WDT0 (hang)";
-    case TG1WDT_SYS_RESET:       return "TASK_WDT1 (hang)";
-    case TG0WDT_CPU_RESET:       return "TASK_WDT0_CPU (hang)";
-    case TG1WDT_CPU_RESET:       return "TASK_WDT1_CPU (hang)";
-    case RTCWDT_SYS_RESET:       return "RTC_WDT (hang)";
-    case RTCWDT_CPU_RESET:       return "RTC_WDT_CPU (hang)";
-    case RTCWDT_RTC_RESET:       return "RTC_WDT_RTC (hang)";
-    case SUPER_WDT_RESET:        return "SUPER_WDT (hang)";
-    case RTCWDT_BROWN_OUT_RESET: return "BROWNOUT (power dip)";
-    case POWER_GLITCH_RESET:     return "POWER_GLITCH (power dip)";
-    case USB_UART_CHIP_RESET:    return "USB_UART (host reset)";
-    case USB_JTAG_CHIP_RESET:    return "USB_JTAG (host reset)";
-    case EFUSE_RESET:            return "EFUSE";
-    case GLITCH_RTC_RESET:       return "GLITCH";
-    case INTRUSION_RESET:        return "INTRUSION";
-    default:                     return "OTHER/PANIC (crash)";
-  }
 }
 
 // ---- rtdb -------------------------------------------------------------

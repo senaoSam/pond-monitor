@@ -250,7 +250,7 @@ CDN 還沒同步,下載回來是 92 bytes 的 504 頁面。腳本因此**沒有�
 
 | 欄位 | 判讀 |
 |---|---|
-| `reset` | `BROWNOUT` = 電壓掉;`*_WDT (hang)` = 卡死超過 120s;`SW_CPU` = 我們自己重開的(OTA 或連不上 WiFi 四輪);`POWERON` = 上電 |
+| `reset` | `BROWNOUT`/`GLITCH` = 電壓掉;`INT_WDT (CPU froze, hang)` = CPU 整個停擺(300ms 中斷看門狗),在這些板子上幾乎都是電壓不穩;`TASK_WDT (task stuck, hang)` = 迴圈卡住(120s)或 IDLE 被餓死;`PANIC (crash)` = 程式當機;`SW` = 我們自己重開的(OTA 或連不上 WiFi 四輪);`POWERON` = 上電。b52/h4/a16 以前的紀錄用舊標籤:`TASK_WDT1 (hang)` 其實是 `INT_WDT`,`SW_CPU` 裡混著當機(分不出來) |
 | `gap` | 距離上次健康心跳幾秒。**這是最有用的欄位** |
 | `prevUptime` | 上一輪活了多久。只有幾秒 = 重開迴圈,不是單一事件 |
 | `attempts` | 每個 SSID 的結果與耗時 |

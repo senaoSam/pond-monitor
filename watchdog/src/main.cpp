@@ -36,7 +36,6 @@
 #include <esp_image_format.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
-#include <rom/rtc.h>
 #include <esp_task_wdt.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -46,6 +45,7 @@
 #include <time.h>
 
 #include "pull_ota.h"
+#include "reset_reason.h"
 #include "secrets.h"
 
 // ---- configuration ----------------------------------------------------
@@ -57,10 +57,10 @@ static const char *DEVICE_ID = "watchdog";
 // tested, so its first sighting is not announced -- see runCheck().
 static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b51-2026.10.15";
+static const char *FW_VERSION = "b52-2026.10.16";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 51;
+static const uint32_t FW_VERSION_CODE = 52;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -476,34 +476,6 @@ static bool connectWiFi() {
     return true;
   }
   return false;
-}
-
-// RTC_SW_* is our own ESP.restart(), *WDT_* is a hang, BROWNOUT is the supply
-// sagging (a thin USB cable does this), and PANIC is a crash.
-// Enum names are the ESP32-S3 set; the S3 has no plain SW_CPU_RESET.
-static const char *resetReasonName() {
-  switch (rtc_get_reset_reason(0)) {
-    case POWERON_RESET:          return "POWERON (power applied)";
-    case RTC_SW_CPU_RESET:       return "SW_CPU (our ESP.restart)";
-    case RTC_SW_SYS_RESET:       return "SW_SYS (our ESP.restart)";
-    case DEEPSLEEP_RESET:        return "DEEPSLEEP";
-    case TG0WDT_SYS_RESET:       return "TASK_WDT0 (hang)";
-    case TG1WDT_SYS_RESET:       return "TASK_WDT1 (hang)";
-    case TG0WDT_CPU_RESET:       return "TASK_WDT0_CPU (hang)";
-    case TG1WDT_CPU_RESET:       return "TASK_WDT1_CPU (hang)";
-    case RTCWDT_SYS_RESET:       return "RTC_WDT (hang)";
-    case RTCWDT_CPU_RESET:       return "RTC_WDT_CPU (hang)";
-    case RTCWDT_RTC_RESET:       return "RTC_WDT_RTC (hang)";
-    case SUPER_WDT_RESET:        return "SUPER_WDT (hang)";
-    case RTCWDT_BROWN_OUT_RESET: return "BROWNOUT (power dip)";
-    case POWER_GLITCH_RESET:     return "POWER_GLITCH (power dip)";
-    case USB_UART_CHIP_RESET:    return "USB_UART (host reset)";
-    case USB_JTAG_CHIP_RESET:    return "USB_JTAG (host reset)";
-    case EFUSE_RESET:            return "EFUSE";
-    case GLITCH_RTC_RESET:       return "GLITCH";
-    case INTRUSION_RESET:        return "INTRUSION";
-    default:                     return "OTHER/PANIC (crash)";
-  }
 }
 
 // ---- rtdb -------------------------------------------------------------
