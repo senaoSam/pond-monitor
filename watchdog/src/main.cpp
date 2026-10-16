@@ -57,6 +57,8 @@ static const char *DEVICE_ID = "watchdog";
 // tested, so its first sighting is not announced -- see runCheck().
 static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
+// The next release is w55: "b" dates from when this was board B, and B is now
+// a pond. Only the label changes; FW_VERSION_CODE carries on from 54.
 static const char *FW_VERSION = "b54-2026.10.16";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
