@@ -57,10 +57,10 @@ static const char *DEVICE_ID = "watchdog";
 // tested, so its first sighting is not announced -- see runCheck().
 static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b52-2026.10.16";
+static const char *FW_VERSION = "b53-2026.10.16";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 52;
+static const uint32_t FW_VERSION_CODE = 53;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -875,6 +875,9 @@ static bool writeAlert(const String &id, bool active, time_t lastSeen,
     // Cleared on every fresh alert: driveNotifications() sets it back once it
     // sees the reaction, so a new alert has to start from unacknowledged.
     body += ",\"acked\":false";
+    // And the previous episode's progress, which batchSave() rewrites for
+    // this one (see alertsRestore).
+    body += ",\"state\":null";
   } else {
     body += ",\"clearedAt\":" + String((uint32_t)now);
   }
@@ -953,10 +956,16 @@ static const int RING_S = 25;
 
 // The phone rings together with this Discord notification of an episode --
 // the third -- if none has been ticked: notifications go out at 0, 5 and 10
-// minutes after a node is found stale, so the call lands ~10 minutes in, ~15
-// after the supply actually failed (b48 waited one more period, ~20; the user
-// asked for it with the third). Keyed to time rather than to how many posts
-// succeeded, so a Discord outage cannot hold the phone back.
+// minutes after a node went stale, so the call lands ~15 minutes after the
+// supply actually failed (b48 waited one more period, ~20; the user asked for
+// it with the third). Keyed to time rather than to how many posts succeeded,
+// so a Discord outage cannot hold the phone back.
+//
+// The episode starts when the node went stale -- its last beat plus the stale
+// limit -- not when this board noticed. Since b53: before, a watchdog that was
+// itself down (or rebooting, which a sagging supply made it do every few
+// minutes) restarted the ten minutes from whenever it got back, and a supply
+// that failed while it was down rang 30 minutes late instead of at once.
 static const int NOTIFIES_BEFORE_CALL = 3;
 
 // When an episode's first call is due: the moment its NOTIFIES_BEFORE_CALL-th
@@ -1146,8 +1155,9 @@ static bool airHealthy() {
 
 // ---- per-node state ---------------------------------------------------
 //
-// One entry per node seen in /devices. RAM only: after a reboot the first
-// check re-raises whatever is stale, which errs toward notifying.
+// One entry per node seen in /devices. Held in RAM, but rebuilt from /alerts
+// after a reboot (alertsRestore), so an alert carries on where it was instead
+// of starting over.
 //
 // The text added in b48 is written as plain UTF-8. That is valid JSON as it
 // stands; the \uXXXX escapes elsewhere in this file predate it and are left
@@ -1289,17 +1299,21 @@ struct Batch {
   int epPosts = 0;       // posts this episode, which set the schedule below
   int calls = 0;         // phone rounds this episode
   uint32_t failures = 0; // consecutive failed posts, drives the backoff
+  bool dirty = false;    // changed since batchSave() last wrote it
 };
 static const int MAX_BATCHES = 12;
 static Batch batches[MAX_BATCHES];
 static time_t lastPhoneAt = 0;
 
-static int batchOpen(time_t now) {
+// episodeAt is when the episode began: for a node found stale, the moment it
+// went stale, which may be well before now if this board was down then.
+static int batchOpen(time_t episodeAt) {
   for (int i = 0; i < MAX_BATCHES; i++)
     if (!batches[i].inUse) {
       batches[i] = Batch();
       batches[i].inUse = true;
-      batches[i].episodeAt = now;
+      batches[i].episodeAt = episodeAt;
+      batches[i].dirty = true;
       return i;
     }
   // All in use: fold into the newest rather than leave the node unreported.
@@ -1316,6 +1330,126 @@ static int batchMembers(int b) {
         nodeStates[i].batch == b)
       n++;
   return n;
+}
+
+// ---- surviving a reboot ---------------------------------------------------
+//
+// This board reboots -- updates, and for days on end a sagging supply that
+// restarted it every few minutes. With the batches in RAM alone, each reboot
+// re-raised every open alert from scratch: the first notification again, the
+// ten minutes to the phone again, an acknowledgement forgotten. A supply that
+// failed during such a stretch could ring 20 minutes late, or not at all.
+//
+// So each batch's progress is kept next to its alerts, as
+//   /alerts/<id>/state  {episodeAt, sent, epPosts, calls, lastCall, ackedAt, msgId}
+// on every member, rewritten whenever it changes (a handful of times per
+// episode), and read back once at boot. writeAlert() clears it when a fresh
+// episode starts, so it never describes an older outage.
+
+// One multi-path PATCH for all changed batches, rather than a TLS round trip
+// per node.
+static void batchSave() {
+  String body;
+  for (int b = 0; b < MAX_BATCHES; b++) {
+    Batch &B = batches[b];
+    if (!B.inUse || !B.dirty) continue;
+    String st = "{\"episodeAt\":" + String((uint32_t)B.episodeAt);
+    st += ",\"sent\":" + String(B.sent);
+    st += ",\"epPosts\":" + String(B.epPosts);
+    st += ",\"calls\":" + String(B.calls);
+    st += ",\"lastCall\":" + String((uint32_t)lastPhoneAt);
+    st += ",\"ackedAt\":" + String((uint32_t)B.ackedAt);
+    st += ",\"msgId\":\"" + B.msgId + "\"}";
+    for (int i = 0; i < MAX_NODES; i++) {
+      const NodeState &ns = nodeStates[i];
+      if (!ns.inUse || !ns.alertActive || ns.batch != b) continue;
+      body += body.length() ? "," : "{";
+      body += "\"" + ns.id + "/state\":" + st;
+    }
+  }
+  if (!body.length()) return;
+  body += "}";
+  if (rtdbRequest("PATCH", "/alerts.json", body, nullptr)) {
+    for (int b = 0; b < MAX_BATCHES; b++) batches[b].dirty = false;
+  } else {
+    // Left dirty: the next check tries again.
+    logLine("alert state save FAILED: %s", lastError.c_str());
+  }
+}
+
+// Once, before the first check after boot. Every alert still active comes back
+// as it was; the check then carries on from there -- clearing the ones whose
+// node recovered meanwhile, and leaving the stale ones in their episode.
+// Members of one batch share a message, so they are regrouped by it.
+static bool alertsRestored = false;
+static int alertsRestoreTries = 0;
+
+static bool alertsRestore() {
+  if (alertsRestored) return true;
+  String body;
+  if (!rtdbRequest("GET", "/alerts.json", "", &body)) {
+    // Not forever: after a few tries the check goes ahead without, which at
+    // worst re-raises from scratch -- the old behaviour, still an alert.
+    if (++alertsRestoreTries < 3) {
+      logLine("alert restore: read FAILED, retrying next check");
+      return false;
+    }
+    logLine("alert restore: giving up, starting fresh");
+    alertsRestored = true;
+    return true;
+  }
+  alertsRestored = true;
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    logLine("alert restore: parse FAILED, starting fresh");
+    return true;
+  }
+
+  String keys[MAX_BATCHES];
+  int restored = 0;
+  for (JsonPairConst p : doc.as<JsonObjectConst>()) {
+    JsonVariantConst a = p.value();
+    if (!a["active"].as<bool>()) continue;
+    NodeState &ns = nodeState(p.key().c_str());
+    ns.alertActive = true;
+    ns.lastSeen = a["lastSeen"].as<uint32_t>();
+
+    // Raised but never saved (this board went down within the check that
+    // raised it): its own batch, from when it was raised.
+    JsonVariantConst st = a["state"];
+    String key = st["msgId"].as<String>();
+    if (st.isNull()) key = "";
+    else if (!key.length() || key == "null")
+      key = "ep" + String(st["episodeAt"].as<uint32_t>());
+
+    int b = -1;
+    for (int i = 0; key.length() && i < MAX_BATCHES; i++)
+      if (batches[i].inUse && keys[i] == key) b = i;
+    if (b < 0) {
+      time_t ep = st.isNull() ? a["firedAt"].as<uint32_t>()
+                              : st["episodeAt"].as<uint32_t>();
+      b = batchOpen(ep);
+      keys[b] = key;
+      Batch &B = batches[b];
+      B.dirty = false;  // nothing new to write
+      if (!st.isNull()) {
+        B.sent = st["sent"] | 0;
+        B.epPosts = st["epPosts"] | 0;
+        B.calls = st["calls"] | 0;
+        B.ackedAt = st["ackedAt"].as<uint32_t>();
+        B.msgId = (key.startsWith("ep")) ? "" : key;
+        time_t lastCall = st["lastCall"].as<uint32_t>();
+        if (lastCall > lastPhoneAt) lastPhoneAt = lastCall;
+      } else {
+        B.dirty = true;
+      }
+    }
+    ns.batch = b;
+    restored++;
+    logLine("alert restored: %s (batch %d)", ns.id.c_str(), b);
+  }
+  if (restored) logLine("alert restore: %d active", restored);
+  return true;
 }
 
 // The message for one batch. One node reads like the old per-node alert; more
@@ -1391,6 +1525,7 @@ static void driveBatches(time_t now) {
     if (!B.inUse) continue;
     if (B.msgId.length() && !B.ackedAt && discordAcked(B.msgId)) {
       B.ackedAt = now;
+      B.dirty = true;
       notifyAcked++;
       logLine("batch %d acknowledged, muting %lu min", b,
               (unsigned long)(ACK_MUTE_S / 60));
@@ -1412,6 +1547,7 @@ static void driveBatches(time_t now) {
       B.episodeAt = now;
       B.epPosts = 0;
       B.calls = 0;
+      B.dirty = true;
     }
   }
 
@@ -1430,8 +1566,10 @@ static void driveBatches(time_t now) {
     for (int b = 0; b < MAX_BATCHES; b++) {
       Batch &B = batches[b];
       if (B.inUse && !B.ackedAt && B.calls < CALL_MAX &&
-          now >= callDueAt(B.episodeAt))
+          now >= callDueAt(B.episodeAt)) {
         B.calls++;
+        B.dirty = true;
+      }
     }
     logLine("unacknowledged alerts, phoning");
     // No node in the call: the module then just says "鱼塘监控警报". Which
@@ -1466,6 +1604,7 @@ static void driveBatches(time_t now) {
       int slot = (int)((now - B.episodeAt) / RENOTIFY_S) + 1;
       B.epPosts = B.epPosts + 1 > slot ? B.epPosts + 1 : slot;
       B.failures = 0;
+      B.dirty = true;
       notifySent++;
       logLine("batch %d notified (%d nodes, #%d)", b, batchMembers(b), B.sent);
     } else {
@@ -1473,6 +1612,8 @@ static void driveBatches(time_t now) {
       logLine("batch %d notify FAILED (#%lu)", b, (unsigned long)B.failures);
     }
   }
+
+  batchSave();
 }
 
 static int batchesOpen() {
@@ -1582,6 +1723,7 @@ static void runCheck() {
   }
 
   alertControlLoad();
+  if (!alertsRestore()) return;  // not yet: re-raising would start them over
 
   time_t now = time(nullptr);
   int stale = 0, healthy = 0, loud = 0;
@@ -1681,6 +1823,18 @@ static void runCheck() {
     if (ns.muted != wasMuted)
       logLine("%s alerts switched %s", id.c_str(), ns.muted ? "off" : "on");
 
+    // A restored alert whose node came back and went quiet again while this
+    // board was down: a different outage. Close the old one quietly -- the
+    // node's own /outages record has its true end -- and raise the new one.
+    if (isStale && ns.alertActive && ts > 0 && (time_t)ts != ns.lastSeen) {
+      writeAlert(id, false, ns.lastSeen, "replaced by a later outage");
+      writeOutage(id, ns.lastSeen, false, 0, "");
+      ns.alertActive = false;
+      ns.batch = -1;
+      logLine("%s: earlier alert closed, it recovered and failed again unwatched",
+              id.c_str());
+    }
+
     // Transition detection uses state this device already holds, rather than
     // re-fetching /alerts/<id>/active every minute: each such fetch was a full
     // TLS handshake to re-read a boolean we wrote ourselves.
@@ -1694,8 +1848,16 @@ static void runCheck() {
         writeOutage(id, ns.lastSeen, true, 0, reason);
         // Switched off: recorded like any other, but in no batch, so nothing
         // posts and nothing rings.
+        // The episode runs from when it went stale, so a board that was
+        // itself down then catches up at once rather than starting the clock
+        // now. Nodes raised together share the earliest start.
+        time_t wentStale = ts > 0 ? (time_t)ts + limit : now;
+        if (wentStale > now) wentStale = now;
         if (!ns.muted) {
-          if (newBatch < 0) newBatch = batchOpen(now);
+          if (newBatch < 0) newBatch = batchOpen(wentStale);
+          if (wentStale < batches[newBatch].episodeAt)
+            batches[newBatch].episodeAt = wentStale;
+          batches[newBatch].dirty = true;
           ns.batch = newBatch;
         }
         logLine("ALERT RAISED %s: %s (batch %d%s)", id.c_str(), reason.c_str(),
@@ -1732,6 +1894,7 @@ static void runCheck() {
     } else if (ns.alertActive && !ns.muted && ns.batch < 0) {
       // Switched back on while still down: speaks up now, as a fresh alert.
       if (newBatch < 0) newBatch = batchOpen(now);
+      batches[newBatch].dirty = true;
       ns.batch = newBatch;
       logLine("%s switched on while down, alerting (batch %d)", id.c_str(),
               newBatch);
