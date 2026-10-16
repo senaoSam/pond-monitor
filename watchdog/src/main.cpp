@@ -57,10 +57,10 @@ static const char *DEVICE_ID = "watchdog";
 // tested, so its first sighting is not announced -- see runCheck().
 static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
-static const char *FW_VERSION = "b53-2026.10.16";
+static const char *FW_VERSION = "b54-2026.10.16";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 53;
+static const uint32_t FW_VERSION_CODE = 54;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -1780,12 +1780,6 @@ static void runCheck() {
     if (extractNumber(obj, 0, "temp", &temp))
       ns.reading = String(temp, 1) + " \\u00b0C";
 
-    int site = siteIndex(id);
-    if (site >= 0) {
-      siteTotal[site]++;
-      if (isStale) siteStale[site]++;
-    }
-
     // A node publishing happily from an unexpected network has been carried
     // somewhere -- see announceNodeMove.
     announceNodeMove(id, obj, isStale);
@@ -1822,6 +1816,16 @@ static void runCheck() {
     ns.muted = !alertsEnabledFor(id, now);
     if (ns.muted != wasMuted)
       logLine("%s alerts switched %s", id.c_str(), ns.muted ? "off" : "on");
+
+    // Only nodes whose alerts are on count toward "the whole pond is down": a
+    // board switched off is usually unplugged on purpose (packed away, under
+    // repair), and counting it made one real outage read as the pond's
+    // network failing.
+    int site = siteIndex(id);
+    if (site >= 0 && !ns.muted) {
+      siteTotal[site]++;
+      if (isStale) siteStale[site]++;
+    }
 
     // A restored alert whose node came back and went quiet again while this
     // board was down: a different outage. Close the old one quietly -- the
