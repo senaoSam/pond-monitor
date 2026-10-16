@@ -37,13 +37,14 @@ NVS、連上後上傳 `/incidents/`——見「斷線事件記錄」章節。
 | 功能 | 正常上傳水溫 | 正常監控 + Discord 告警 + **撥電話(經 air-dialer)** |
 | WiFi 憑證 | NVS,`/wifi` 可改(**無 `clear=1`**) | NVS,`/wifi` 可改 |
 | 手機熱點救援 | ✅ 全程實測(09-04,a12 測試版) | ✅ 全程實測(09-03) |
-| 魚塭網路 | **`20170330`**(a16 起;a15 曾是 Netcore_20260501) | `20170330` |
+| 魚塭網路 | **`20170330`**(t16 起;a15 曾是 Netcore_20260501) | `20170330` |
 | 救援熱點 | **`iQOO Neo3`**(NVS + a15 編譯值) | `OPPO K9 Pro 5G`(未更新) |
 | Discord | 無 token,由 B 代發 | 直接發(告警 + 狀態回報) |
 | 斷線事件記錄 | ✅ b46/a14 起,含 reset reason 解碼(A 首次有) | ✅ |
 
 **魚塭網路一律是 `20170330`**(2026-10-17 使用者指定):`Netcore_20260501` 不再使用,
-已從心跳板(h5 起)和 pond-site(a16 起)的編譯清單拿掉;watchdog 一直是 20170330。
+已從心跳板(h5 起)和 pond-site(t16 起)的編譯清單拿掉;watchdog 一直是 20170330。
+pond-site 的版本前綴從 t16 起改成 `t`(temperature):`a` 和魚塭代號 A 撞名。版本比對只看數字,a15 → t16 照常升級。
 pond-site 的 NVS 目標本來就是 20170330。
 
 兩片都在台北家中運作,連 `Wang3697`,資料持續進 RTDB。09-04 的連續觀測:
@@ -254,7 +255,7 @@ CDN 還沒同步,下載回來是 92 bytes 的 504 頁面。腳本因此**沒有�
 
 | 欄位 | 判讀 |
 |---|---|
-| `reset` | `BROWNOUT`/`GLITCH` = 電壓掉;`INT_WDT (CPU froze, hang)` = CPU 整個停擺(300ms 中斷看門狗),在這些板子上幾乎都是電壓不穩;`TASK_WDT (task stuck, hang)` = 迴圈卡住(120s)或 IDLE 被餓死;`PANIC (crash)` = 程式當機;`SW` = 我們自己重開的(OTA 或連不上 WiFi 四輪);`POWERON` = 上電。b52/h4/a16 以前的紀錄用舊標籤:`TASK_WDT1 (hang)` 其實是 `INT_WDT`,`SW_CPU` 裡混著當機(分不出來) |
+| `reset` | `BROWNOUT`/`GLITCH` = 電壓掉;`INT_WDT (CPU froze, hang)` = CPU 整個停擺(300ms 中斷看門狗),在這些板子上幾乎都是電壓不穩;`TASK_WDT (task stuck, hang)` = 迴圈卡住(120s)或 IDLE 被餓死;`PANIC (crash)` = 程式當機;`SW` = 我們自己重開的(OTA 或連不上 WiFi 四輪);`POWERON` = 上電。b52/h4/t16 以前的紀錄用舊標籤:`TASK_WDT1 (hang)` 其實是 `INT_WDT`,`SW_CPU` 裡混著當機(分不出來) |
 | `gap` | 距離上次健康心跳幾秒。**這是最有用的欄位** |
 | `prevUptime` | 上一輪活了多久。只有幾秒 = 重開迴圈,不是單一事件 |
 | `attempts` | 每個 SSID 的結果與耗時 |
