@@ -284,7 +284,7 @@ alertControl/
   groups/<群組id>: { members: {A01:true, A02:true}, enabled: false,
                      until: 1792000000, note: "換馬達" }
   nodes/<板子id>:  { enabled: true, until: ..., note: ... }
-  callNumbers:     ["0927098892", "0910883672", ...]   撥號名單,依序撥
+  callNumbers:     ["09xxxxxxxx", "09yyyyyyyy"]             撥號名單,依序撥
 ```
 
 - `callNumbers`（w56 起）：每一輪照這個順序撥。改了最多 1 分鐘生效,Discord
