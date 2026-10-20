@@ -59,10 +59,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w55-2026.10.17";
+static const char *FW_VERSION = "w56-2026.10.20";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 55;
+static const uint32_t FW_VERSION_CODE = 56;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -932,7 +932,8 @@ static void writeOutage(const String &id, time_t start, bool active,
 // Protocol, one line each way (see air-dialer/dialer.lua):
 //   PING                     -> PONG csq=<n> reg=<0|1> ims=<0|1>
 //   LINK                     (sent on each PONG: "I heard you")
-//   DIAL <num> <ring_s> <node> <min> -> ACK, later DONE <outcome>
+//   DIAL <num> <ring_s>      -> ACK, later DONE <outcome>
+//   HANGUP                   (the DIAL in progress ends with DONE cancelled)
 //   (module boot)            -> READY <version>
 //
 // Driven from loop() without blocking: a call takes ~30s, and waiting for it
@@ -975,14 +976,121 @@ static const int NOTIFIES_BEFORE_CALL = 3;
 static time_t callDueAt(time_t episodeAt) {
   return episodeAt + (NOTIFIES_BEFORE_CALL - 1) * RENOTIFY_S;
 }
-static const uint32_t CALL_REPEAT_S = 10 * 60;
-static const int CALL_MAX = 3;  // rounds per episode
+// After the first, a round every CALL_REPEAT_S -- counted from the start of
+// the last one, a round still dialing when the next is due finishing first --
+// for as long as the alert stands. Only a tick on Discord (or the node coming
+// back) stops it: answering does not. The phone is an alarm clock and nothing
+// more, so a call picked up half-asleep, or by a voicemail box, is not taken
+// as anyone knowing. Until w56 it was every 10 minutes, three rounds at most,
+// after which the phone went quiet whether anyone had woken or not.
+static const uint32_t CALL_REPEAT_S = 3 * 60;
 
-static const char *CALL_NUMBER_LIST[] = CALL_NUMBERS;
-static const int CALL_NUMBER_COUNT =
-    sizeof(CALL_NUMBER_LIST) / sizeof(CALL_NUMBER_LIST[0]);
+// The numbers, rung one after another in this order each round. They live in
+// /alertControl/callNumbers (a list), so they are changed from RTDB without a
+// release. The last list read is kept in NVS, so a reboot with RTDB out of
+// reach still rings the right phones; until a list has ever been read, the one
+// compiled in from secrets.h.
+static const char *CALL_NUMBERS_BUILTIN[] = CALL_NUMBERS;
+static const int MAX_CALL_NUMBERS = 6;
+static String callNumbers[MAX_CALL_NUMBERS];
+static int callNumberCount = 0;
+static String callNumbersFrom = "built-in";  // built-in | nvs | db
+static String callNumbersBad = "";           // last unusable list warned about
+static Preferences callPrefs;
 
 static bool discordSay(const String &content);
+
+// What the module accepts (dialer.lua checks the same): digits, an optional
+// leading +, 6 to 15 long.
+static bool callNumberValid(const String &n) {
+  int start = n.startsWith("+") ? 1 : 0;
+  if ((int)n.length() - start < 6 || n.length() > 15) return false;
+  for (int i = start; i < (int)n.length(); i++)
+    if (!isDigit(n[i])) return false;
+  return true;
+}
+
+static String callNumbersJoined() {
+  String s;
+  for (int i = 0; i < callNumberCount; i++)
+    s += (i ? "," : "") + callNumbers[i];
+  return s;
+}
+
+// Takes a comma-separated list; returns how many usable numbers it held. With
+// none, the current list is left alone.
+static int callNumbersSet(const String &list, const char *from) {
+  String found[MAX_CALL_NUMBERS];
+  int n = 0, pos = 0;
+  while (pos <= (int)list.length() && n < MAX_CALL_NUMBERS) {
+    int comma = list.indexOf(',', pos);
+    if (comma < 0) comma = list.length();
+    String num = list.substring(pos, comma);
+    num.trim();
+    if (callNumberValid(num)) found[n++] = num;
+    else if (num.length()) logLine("call numbers: ignoring \"%s\"", num.c_str());
+    pos = comma + 1;
+  }
+  if (!n) return 0;
+  for (int i = 0; i < n; i++) callNumbers[i] = found[i];
+  callNumberCount = n;
+  callNumbersFrom = from;
+  return n;
+}
+
+// Once, at boot.
+static void callNumbersLoad() {
+  callPrefs.begin("calls", true);
+  String saved = callPrefs.getString("list", "");
+  callPrefs.end();
+  if (callNumbersSet(saved, "nvs")) return;
+  String builtin;
+  for (const char *n : CALL_NUMBERS_BUILTIN)
+    builtin += String(builtin.length() ? "," : "") + n;
+  callNumbersSet(builtin, "built-in");
+}
+
+// Called with /alertControl/callNumbers on every good read of it. A missing
+// entry leaves the list as it is. One with nothing dialable in it is taken for
+// a mistake rather than a wish for silence -- switching alerts off is what the
+// rest of /alertControl is for -- so the old list stays, and Discord hears
+// about it once.
+static void callNumbersFromDb(JsonVariantConst v) {
+  if (v.isNull()) return;
+  String list;
+  if (v.is<JsonArrayConst>()) {
+    for (JsonVariantConst e : v.as<JsonArrayConst>())
+      list += (list.length() ? "," : "") + e.as<String>();
+  } else if (v.is<JsonObjectConst>()) {
+    // A list edited by hand in the Firebase console comes back as an object
+    // once an entry in the middle is deleted: {"0":..,"2":..}, keys in order.
+    for (JsonPairConst e : v.as<JsonObjectConst>())
+      list += (list.length() ? "," : "") + e.value().as<String>();
+  } else {
+    list = v.as<String>();
+  }
+
+  String before = callNumbersJoined();
+  String beforeFrom = callNumbersFrom;
+  if (!callNumbersSet(list, "db")) {
+    if (list != callNumbersBad) {
+      callNumbersBad = list;
+      logLine("call numbers: nothing dialable in db, keeping %s",
+              before.c_str());
+      discordSay("📞 撥號名單裡沒有可撥的號碼，沿用：" + before);
+    }
+    return;
+  }
+  callNumbersBad = "";
+  String now = callNumbersJoined();
+  if (now == before && beforeFrom != "built-in") return;
+  callPrefs.begin("calls", false);
+  callPrefs.putString("list", now);
+  callPrefs.end();
+  if (now == before) return;  // the built-in list confirmed: nothing to say
+  logLine("call numbers: %s (was %s)", now.c_str(), before.c_str());
+  discordSay("📞 撥號名單：" + now);
+}
 
 struct AirStatus {
   bool everAnswered = false;
@@ -996,13 +1104,15 @@ struct AirStatus {
   String version = "";
 } air;
 
+// alarm: rung for an alert, so dropped the moment that is ticked. A /testcall
+// is not, and always goes through.
 struct PendingDial {
-  String number, node;
-  uint32_t minutes;
+  String number;
+  bool alarm;
 };
-static PendingDial dialQueue[6];
+static PendingDial dialQueue[MAX_CALL_NUMBERS];
 static int dialQueueLen = 0;
-static bool dialInFlight = false;
+static bool dialInFlight = false, dialIsAlarm = false;
 static uint32_t dialStartMs = 0;
 static String dialNumber;
 static bool pongAwaited = false;
@@ -1010,21 +1120,49 @@ static uint32_t pingSentMs = 0;
 static uint32_t nextPingMs = 15000;  // first PING shortly after boot
 static String airLine;
 
-// Queues one call per configured number. Node ids are sent as-is: they are
-// our own RTDB keys (no spaces), and the module reads them out by TTS.
-static void airDial(const String &node, uint32_t minutes) {
-  for (int i = 0; i < CALL_NUMBER_COUNT; i++) {
-    if (dialQueueLen >= (int)(sizeof(dialQueue) / sizeof(dialQueue[0]))) {
-      logLine("air: dial queue full, dropping %s", CALL_NUMBER_LIST[i]);
+// Queues one call per number, in order.
+static void airDial(bool alarm) {
+  for (int i = 0; i < callNumberCount; i++) {
+    if (dialQueueLen >= MAX_CALL_NUMBERS) {
+      logLine("air: dial queue full, dropping %s", callNumbers[i].c_str());
       continue;
     }
-    dialQueue[dialQueueLen++] = {CALL_NUMBER_LIST[i], node, minutes};
+    dialQueue[dialQueueLen++] = {callNumbers[i], alarm};
   }
 }
 
 static void airSend(const String &line) {
   Serial1.print(line + "\n");
 }
+
+// Whether a round rung for an alert is still under way.
+static bool airAlarmPending() {
+  if (dialInFlight && dialIsAlarm) return true;
+  for (int i = 0; i < dialQueueLen; i++)
+    if (dialQueue[i].alarm) return true;
+  return false;
+}
+
+// The alert was ticked (or recovered, or switched off): the rest of the round
+// is dropped, and a phone ringing right now stops.
+static void airCancelAlarm() {
+  int kept = 0, dropped = 0;
+  for (int i = 0; i < dialQueueLen; i++) {
+    if (dialQueue[i].alarm) dropped++;
+    else dialQueue[kept++] = dialQueue[i];
+  }
+  dialQueueLen = kept;
+  bool ringing = dialInFlight && dialIsAlarm;
+  if (ringing) airSend("HANGUP");  // DONE cancelled follows
+  if (dropped || ringing)
+    logLine("air: alarm stopped, %d queued call(s) dropped%s", dropped,
+            ringing ? ", hanging up" : "");
+}
+
+// Defined with the batches: polls Discord for a tick, and says whether any
+// alert still wants the phone. Asked before each call of a round, so a tick
+// stops the numbers not yet rung rather than waiting for the next check.
+static bool phoneStillWanted();
 
 static void airHandleLine(String line) {
   line.trim();
@@ -1103,19 +1241,19 @@ static void airService() {
   }
 
   if (!dialInFlight && dialQueueLen > 0) {
+    if (dialQueue[0].alarm && !phoneStillWanted()) {
+      airCancelAlarm();
+      return;
+    }
     PendingDial d = dialQueue[0];
     for (int i = 1; i < dialQueueLen; i++) dialQueue[i - 1] = dialQueue[i];
     dialQueueLen--;
     dialInFlight = true;
+    dialIsAlarm = d.alarm;
     dialStartMs = millis();
     dialNumber = d.number;
-    // Node and minutes only when there is a node: the module splits on
-    // whitespace, so an empty node would shift the minutes into its place.
-    String cmd = "DIAL " + d.number + " " + String(RING_S);
-    if (d.node.length()) cmd += " " + d.node + " " + String(d.minutes);
-    airSend(cmd);
-    logLine("air: dialing %s%s%s", d.number.c_str(),
-            d.node.length() ? " for " : "", d.node.c_str());
+    airSend("DIAL " + d.number + " " + String(RING_S));
+    logLine("air: dialing %s%s", d.number.c_str(), d.alarm ? "" : " (test)");
     return;
   }
 
@@ -1253,6 +1391,7 @@ static void alertControlLoad() {
     return;
   }
   alertCtl = std::move(doc);
+  callNumbersFromDb(alertCtl["callNumbers"]);
 }
 
 static bool alertEntryLive(JsonVariantConst e, time_t now) {
@@ -1507,12 +1646,55 @@ static String alertText(int b, time_t now) {
 
   time_t callFrom = callDueAt(B.episodeAt);
   if (B.calls > 0)
-    c += "已撥電話：" + String(B.calls) + " 次\\n";
+    c += "已撥電話 " + String(B.calls) + " 輪，每 " +
+         String(CALL_REPEAT_S / 60) + " 分鐘再撥，按 ✅ 才停\\n";
   else if (callFrom > now)
     c += String((int)((callFrom - now + 59) / 60)) + " 分鐘內沒人確認會撥電話\\n";
 
   c += "點 ✅ 回報已知悉（靜音 " + String(ACK_MUTE_S / 60) + " 分鐘）";
   return c;
+}
+
+// Looks for a tick on each batch's latest message. Run every check, and again
+// before each call of a round -- skipped then if it ran moments ago, since a
+// round of several numbers asks once per number.
+static uint32_t lastAckPollMs = 0;
+static const uint32_t ACK_POLL_MIN_MS = 15000;
+
+static void pollAcks(time_t now) {
+  lastAckPollMs = millis();
+  for (int b = 0; b < MAX_BATCHES; b++) {
+    Batch &B = batches[b];
+    if (!B.inUse || B.ackedAt || !B.msgId.length()) continue;
+    if (!discordAcked(B.msgId)) continue;
+    B.ackedAt = now;
+    B.dirty = true;
+    notifyAcked++;
+    logLine("batch %d acknowledged, muting %lu min", b,
+            (unsigned long)(ACK_MUTE_S / 60));
+    for (int i = 0; i < MAX_NODES; i++) {
+      NodeState &ns = nodeStates[i];
+      if (ns.inUse && ns.alertActive && ns.batch == b)
+        rtdbRequest("PATCH", "/alerts/" + ns.id + ".json",
+                    "{\"acked\":true,\"ackedAt\":" + String((uint32_t)now) + "}",
+                    nullptr);
+    }
+  }
+}
+
+// Some open batch, unticked, has reached its first call.
+static bool phoneDue(time_t now) {
+  for (int b = 0; b < MAX_BATCHES; b++) {
+    const Batch &B = batches[b];
+    if (B.inUse && !B.ackedAt && now >= callDueAt(B.episodeAt)) return true;
+  }
+  return false;
+}
+
+static bool phoneStillWanted() {
+  time_t now = time(nullptr);
+  if (millis() - lastAckPollMs >= ACK_POLL_MIN_MS) pollAcks(now);
+  return phoneDue(now);
 }
 
 // Runs every check: acknowledgements, the phone, then Discord, per batch.
@@ -1522,23 +1704,10 @@ static void driveBatches(time_t now) {
     if (batches[b].inUse && !batchMembers(b)) batches[b].inUse = false;
 
   // Acknowledgements and mute expiry.
+  pollAcks(now);
   for (int b = 0; b < MAX_BATCHES; b++) {
     Batch &B = batches[b];
     if (!B.inUse) continue;
-    if (B.msgId.length() && !B.ackedAt && discordAcked(B.msgId)) {
-      B.ackedAt = now;
-      B.dirty = true;
-      notifyAcked++;
-      logLine("batch %d acknowledged, muting %lu min", b,
-              (unsigned long)(ACK_MUTE_S / 60));
-      for (int i = 0; i < MAX_NODES; i++) {
-        NodeState &ns = nodeStates[i];
-        if (ns.inUse && ns.alertActive && ns.batch == b)
-          rtdbRequest("PATCH", "/alerts/" + ns.id + ".json",
-                      "{\"acked\":true,\"ackedAt\":" + String((uint32_t)now) + "}",
-                      nullptr);
-      }
-    }
     // An acknowledged alert stays quiet only for the mute window: a node still
     // dead an hour later has to speak up again, and the phone waits its turn
     // again from there.
@@ -1553,30 +1722,23 @@ static void driveBatches(time_t now) {
     }
   }
 
-  // The phone: one call however many batches are waiting. It is only there to
-  // wake someone up; what failed is in Discord. Keyed to time, not to how
+  // The phone: one round however many batches are waiting. It is only there
+  // to wake someone up; what failed is in Discord. Keyed to time, not to how
   // many posts succeeded, so a Discord outage cannot hold it back.
-  bool due = false;
-  for (int b = 0; b < MAX_BATCHES; b++) {
-    const Batch &B = batches[b];
-    if (B.inUse && !B.ackedAt && B.calls < CALL_MAX &&
-        now >= callDueAt(B.episodeAt))
-      due = true;
-  }
-  if (due && (!lastPhoneAt || (uint32_t)(now - lastPhoneAt) >= CALL_REPEAT_S)) {
+  if (!phoneDue(now)) {
+    airCancelAlarm();
+  } else if (!airAlarmPending() &&
+             (!lastPhoneAt || (uint32_t)(now - lastPhoneAt) >= CALL_REPEAT_S)) {
     lastPhoneAt = now;
     for (int b = 0; b < MAX_BATCHES; b++) {
       Batch &B = batches[b];
-      if (B.inUse && !B.ackedAt && B.calls < CALL_MAX &&
-          now >= callDueAt(B.episodeAt)) {
+      if (B.inUse && !B.ackedAt && now >= callDueAt(B.episodeAt)) {
         B.calls++;
         B.dirty = true;
       }
     }
-    logLine("unacknowledged alerts, phoning");
-    // No node in the call: the module then just says "鱼塘监控警报". Which
-    // supply failed is for Discord.
-    airDial("", 0);
+    logLine("unacknowledged alerts, phoning %d number(s)", callNumberCount);
+    airDial(true);
   }
 
   // Discord, paced per batch and backed off after failures (doubling, capped
@@ -2342,6 +2504,7 @@ static void handleRoot() {
   b += "dialer calls: " + String(air.calls) + ", last: " + air.lastOutcome +
        ", restarts: " + String(air.restarts) +
        (dialInFlight ? "  [CALLING " + dialNumber + "]" : String("")) + "\n";
+  b += "call numbers (" + callNumbersFrom + "): " + callNumbersJoined() + "\n";
   // Which OTA slot is live, and how much room the next update has. A failed
   // "Could Not Activate" points here first.
   const esp_partition_t *run = esp_ota_get_running_partition();
@@ -2445,9 +2608,9 @@ static void handleTestCall() {
     server.send(403, "text/plain; charset=utf-8", "bad pass");
     return;
   }
-  airDial("test", 0);
+  airDial(false);
   server.send(200, "text/plain; charset=utf-8",
-              "queued " + String(CALL_NUMBER_COUNT) +
+              "queued " + String(callNumberCount) +
                   " call(s); the result shows on / as \"dialer calls\"\n");
 }
 
@@ -2600,6 +2763,7 @@ void setup() {
   // driven to power-cycle it.
   pinMode(AIR_EN_PIN, INPUT);
   Serial1.begin(115200, SERIAL_8N1, AIR_RX_PIN, AIR_TX_PIN);
+  callNumbersLoad();
 
   // Before WiFi: reads what the previous run left behind, and counts this
   // boot. Must happen even if everything below fails.

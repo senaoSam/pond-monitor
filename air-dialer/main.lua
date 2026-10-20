@@ -20,7 +20,7 @@
 -- LuatOS-Air_V4022_RDA8910_TTS_NOLVGL_FLOAT), default lib added.
 
 PROJECT = "AIR_DIALER"
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 require "log"
 LOG_LEVEL = log.LOGLEVEL_INFO

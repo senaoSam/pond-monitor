@@ -49,7 +49,7 @@ http://<ip>/now                   sensor-node: 立即讀取並上傳
 http://<ip>/check                 watchdog: 立即執行一次檢查
 http://<ip>/testalert             watchdog: 發送測試告警
 http://<ip>/testack?msg=<id>      watchdog: 查詢該訊息是否已確認
-http://<ip>/testcall?pass=<OTA密碼> watchdog: 立刻撥一通測試電話
+http://<ip>/testcall?pass=<OTA密碼> watchdog: 立刻依撥號名單撥一輪測試電話
 http://<ip>/fwcheck               立即檢查韌體更新（兩者皆有）
 ```
 

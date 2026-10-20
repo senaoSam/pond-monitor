@@ -4,18 +4,19 @@
 --   (module boots)                      READY <version>
 --   PING                                PONG csq=<0-31|99> reg=<0|1> ims=<0|1>
 --   LINK                                (nothing: "I got your PONG")
---   DIAL <number> [ring_s] [node] [min] ACK, then DONE <outcome> when it ends
+--   DIAL <number> [ring_s]              ACK, then DONE <outcome> when it ends
 --   HANGUP                              (the DIAL in progress ends with DONE)
 --   anything else                       ERR <reason>
 --
 -- outcome: noanswer | answered | busy | rejected | nocarrier | cancelled | busy-local
 -- noanswer is the normal alarm: it rang for ring_s and nobody picked up.
--- If someone does answer, node and minutes are read out by TTS before the
--- call ends, so the board needs no speaker.
+-- If someone does answer, the call is hung up at once: the ringing was the
+-- whole message (it only has to wake someone; what failed is on Discord), and
+-- an answered call is the one that costs money. Since 1.0.4; before, it read
+-- out an alert by TTS for up to 15s.
 module(..., package.seeall)
 
 require "cc"
-require "audio"
 require "pm"
 require "pins"
 
@@ -49,7 +50,7 @@ sys.timerLoopStart(function() up = up + 1 end, 1000)
 
 local REASONS = { BUSY = "busy", ["NO ANSWER"] = "noanswer", ["NO CARRIER"] = "nocarrier" }
 
-local function ring(number, ringS, speech)
+local function ring(number, ringS)
     cc.dial(number)
     local deadline = up + ringS
     while true do
@@ -61,9 +62,6 @@ local function ring(number, ringS, speech)
         end
         local kind, arg = waitCall(math.min(left, 2) * 1000)  -- wake to see HANGUP
         if kind == "connected" then
-            audio.play(7, "TTS", speech, 7, nil, true, 1500)
-            waitCall(15000)
-            audio.stop()
             cc.hangUp(number)
             waitCall(10000)
             return "answered"
@@ -80,18 +78,8 @@ local function ring(number, ringS, speech)
     end
 end
 
--- The TTS engine reads simplified Chinese; traditional characters may come out
--- as silence, so the spoken text is kept in simplified.
-local function speechFor(node, minutes)
-    if not node then return "鱼塘监控警报" end
-    if minutes then
-        return string.format("鱼塘监控警报，%s 已经 %s 分钟没有回报", node, minutes)
-    end
-    return "鱼塘监控警报，" .. node .. " 失联"
-end
-
 local function dial(args)
-    local number, ringS, node, minutes = args[2], tonumber(args[3]), args[4], args[5]
+    local number, ringS = args[2], tonumber(args[3])
     if not number or not number:match("^%+?%d+$") or #number < 6 or #number > 15 then
         return send("ERR bad number")
     end
@@ -101,7 +89,7 @@ local function dial(args)
     calling, hangupRequested = true, false
     send("ACK")
     sys.taskInit(function()
-        local outcome = ring(number, ringS, speechFor(node, minutes))
+        local outcome = ring(number, ringS)
         calling = false
         log.warn("dialer.call", number, outcome)
         send("DONE " .. outcome)
