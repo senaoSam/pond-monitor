@@ -59,10 +59,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w58-2026.10.20";
+static const char *FW_VERSION = "w59-2026.10.20";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 58;
+static const uint32_t FW_VERSION_CODE = 59;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -955,6 +955,11 @@ static const uint32_t AIR_PING_EVERY_MS = 30UL * 1000;
 static const uint32_t AIR_PONG_WAIT_MS = 5000;
 static const uint32_t AIR_DEAD_PINGS = 10;      // missed in a row -> power-cycle
 static const uint32_t AIR_DIAL_TIMEOUT_MS = 90UL * 1000;
+// Between the end of one call and the next DIAL. The module is still tearing
+// the last call down when it reports DONE: a DIAL sent in the same second
+// failed at once as nocarrier and that number never rang (w58, the second
+// number of a round whose first was answered in seconds).
+static const uint32_t AIR_DIAL_GAP_MS = 5000;
 static const int RING_S = 25;
 
 // The phone rings together with this Discord notification of an episode --
@@ -1117,7 +1122,7 @@ struct PendingDial {
 static PendingDial dialQueue[MAX_CALL_NUMBERS];
 static int dialQueueLen = 0;
 static bool dialInFlight = false, dialIsAlarm = false;
-static uint32_t dialStartMs = 0;
+static uint32_t dialStartMs = 0, dialEndMs = 0;
 static String dialNumber;
 static bool pongAwaited = false;
 static uint32_t pingSentMs = 0;
@@ -1190,6 +1195,7 @@ static void airHandleLine(String line) {
   } else if (line.startsWith("DONE")) {
     if (!dialInFlight) return;
     dialInFlight = false;
+    dialEndMs = millis();
     air.calls++;
     air.lastOutcome = line.substring(5);
     air.lastOutcome.trim();
@@ -1199,6 +1205,7 @@ static void airHandleLine(String line) {
     logLine("air: %s", line.c_str());
     if (dialInFlight) {
       dialInFlight = false;
+      dialEndMs = millis();
       air.lastOutcome = line;
     }
   }
@@ -1240,11 +1247,13 @@ static void airService() {
 
   if (dialInFlight && millis() - dialStartMs > AIR_DIAL_TIMEOUT_MS) {
     dialInFlight = false;
+    dialEndMs = millis();
     air.lastOutcome = "timeout";
     logLine("air: call to %s got no DONE in time", dialNumber.c_str());
   }
 
-  if (!dialInFlight && dialQueueLen > 0) {
+  if (!dialInFlight && dialQueueLen > 0 &&
+      millis() - dialEndMs >= AIR_DIAL_GAP_MS) {
     if (dialQueue[0].alarm && !phoneStillWanted()) {
       airCancelAlarm();
       return;
