@@ -59,10 +59,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w57-2026.10.20";
+static const char *FW_VERSION = "w58-2026.10.20";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 57;
+static const uint32_t FW_VERSION_CODE = 58;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -984,6 +984,10 @@ static time_t callDueAt(time_t episodeAt) {
 // as anyone knowing. Until w56 it was every 10 minutes, three rounds at most,
 // after which the phone went quiet whether anyone had woken or not.
 static const uint32_t CALL_REPEAT_S = 3 * 60;
+// Checks come about once a minute, give or take a second, so a round due at
+// exactly 180s could be seen at 179s and slip a whole check (w56 rang 4
+// minutes apart that way). Due this much early counts as due.
+static const uint32_t CALL_SLACK_S = 30;
 
 // The numbers, rung one after another in this order each round. They live in
 // /alertControl/callNumbers (a list), so they are changed from RTDB without a
@@ -1749,7 +1753,8 @@ static void driveBatches(time_t now) {
   if (!phoneDue(now)) {
     airCancelAlarm();
   } else if (!airAlarmPending() &&
-             (!lastPhoneAt || (uint32_t)(now - lastPhoneAt) >= CALL_REPEAT_S)) {
+             (!lastPhoneAt ||
+              (uint32_t)(now - lastPhoneAt) + CALL_SLACK_S >= CALL_REPEAT_S)) {
     lastPhoneAt = now;
     for (int b = 0; b < MAX_BATCHES; b++) {
       Batch &B = batches[b];
