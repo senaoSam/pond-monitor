@@ -59,10 +59,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w56-2026.10.20";
+static const char *FW_VERSION = "w57-2026.10.20";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 56;
+static const uint32_t FW_VERSION_CODE = 57;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -1434,11 +1434,13 @@ static bool alertsEnabledFor(const String &id, time_t now) {
 struct Batch {
   bool inUse = false;
   String msgId;          // last message posted, polled for the tick
+  String older[2];       // the two before it, still polled (see pollAcks)
   time_t episodeAt = 0;  // when this round of alerting began
   time_t lastSent = 0, ackedAt = 0, lastTry = 0;
   int sent = 0;          // posts in all, shown as "第 N 次提醒"
   int epPosts = 0;       // posts this episode, which set the schedule below
   int calls = 0;         // phone rounds this episode
+  bool callPost = false; // a round has rung that Discord has not yet posted
   uint32_t failures = 0; // consecutive failed posts, drives the backoff
   bool dirty = false;    // changed since batchSave() last wrote it
 };
@@ -1482,7 +1484,8 @@ static int batchMembers(int b) {
 // failed during such a stretch could ring 20 minutes late, or not at all.
 //
 // So each batch's progress is kept next to its alerts, as
-//   /alerts/<id>/state  {episodeAt, sent, epPosts, calls, lastCall, ackedAt, msgId}
+//   /alerts/<id>/state  {episodeAt, sent, epPosts, calls, lastCall, ackedAt,
+//                        msgId, older}
 // on every member, rewritten whenever it changes (a handful of times per
 // episode), and read back once at boot. writeAlert() clears it when a fresh
 // episode starts, so it never describes an older outage.
@@ -1500,7 +1503,8 @@ static void batchSave() {
     st += ",\"calls\":" + String(B.calls);
     st += ",\"lastCall\":" + String((uint32_t)lastPhoneAt);
     st += ",\"ackedAt\":" + String((uint32_t)B.ackedAt);
-    st += ",\"msgId\":\"" + B.msgId + "\"}";
+    st += ",\"msgId\":\"" + B.msgId + "\"";
+    st += ",\"older\":\"" + B.older[0] + "," + B.older[1] + "\"}";
     for (int i = 0; i < MAX_NODES; i++) {
       const NodeState &ns = nodeStates[i];
       if (!ns.inUse || !ns.alertActive || ns.batch != b) continue;
@@ -1579,6 +1583,12 @@ static bool alertsRestore() {
         B.calls = st["calls"] | 0;
         B.ackedAt = st["ackedAt"].as<uint32_t>();
         B.msgId = (key.startsWith("ep")) ? "" : key;
+        String older = st["older"] | "";
+        int comma = older.indexOf(',');
+        if (comma >= 0) {
+          B.older[0] = older.substring(0, comma);
+          B.older[1] = older.substring(comma + 1);
+        }
         time_t lastCall = st["lastCall"].as<uint32_t>();
         if (lastCall > lastPhoneAt) lastPhoneAt = lastCall;
       } else {
@@ -1661,12 +1671,19 @@ static String alertText(int b, time_t now) {
 static uint32_t lastAckPollMs = 0;
 static const uint32_t ACK_POLL_MIN_MS = 15000;
 
+//
+// The two messages before the latest count too. Woken by the phone, it is easy
+// to tick the message on screen just as a newer one goes out, and a tick that
+// silently did nothing would leave the phone ringing.
 static void pollAcks(time_t now) {
   lastAckPollMs = millis();
   for (int b = 0; b < MAX_BATCHES; b++) {
     Batch &B = batches[b];
     if (!B.inUse || B.ackedAt || !B.msgId.length()) continue;
-    if (!discordAcked(B.msgId)) continue;
+    if (!discordAcked(B.msgId) &&
+        !(B.older[0].length() && discordAcked(B.older[0])) &&
+        !(B.older[1].length() && discordAcked(B.older[1])))
+      continue;
     B.ackedAt = now;
     B.dirty = true;
     notifyAcked++;
@@ -1718,6 +1735,10 @@ static void driveBatches(time_t now) {
       B.episodeAt = now;
       B.epPosts = 0;
       B.calls = 0;
+      B.callPost = false;
+      // The ticked messages are done with: polled again, their tick would
+      // acknowledge the new episode before it had said a word.
+      B.msgId = B.older[0] = B.older[1] = "";
       B.dirty = true;
     }
   }
@@ -1734,6 +1755,7 @@ static void driveBatches(time_t now) {
       Batch &B = batches[b];
       if (B.inUse && !B.ackedAt && now >= callDueAt(B.episodeAt)) {
         B.calls++;
+        B.callPost = true;
         B.dirty = true;
       }
     }
@@ -1747,11 +1769,22 @@ static void driveBatches(time_t now) {
   for (int b = 0; b < MAX_BATCHES; b++) {
     Batch &B = batches[b];
     if (!B.inUse || B.ackedAt) continue;
-    // On a fixed timetable from the episode start -- 0, 5, 10 minutes -- not
-    // RENOTIFY_S after the previous post. Checks run once a minute, so pacing
-    // off the last post let each one slip by up to a check and the third
-    // landed a minute or two after the phone, which is due at 10 minutes.
-    if (B.epPosts && now < B.episodeAt + (time_t)B.epPosts * RENOTIFY_S) continue;
+    // Before the phone: on a fixed timetable from the episode start -- 0, 5,
+    // 10 minutes -- not RENOTIFY_S after the previous post. Checks run once a
+    // minute, so pacing off the last post let each one slip by up to a check
+    // and the third landed a minute or two after the phone, which is due at
+    // 10 minutes.
+    //
+    // Once the phone has started: one post per round, in the same check, so
+    // whoever the ringing wakes finds a fresh message at the top to tick. On
+    // separate clocks (w56) the phone rang with no message to match and the
+    // two read as out of step.
+    if (B.calls) {
+      if (!B.callPost) continue;
+    } else if (B.epPosts &&
+               now < B.episodeAt + (time_t)B.epPosts * RENOTIFY_S) {
+      continue;
+    }
     if (B.failures) {
       uint32_t wait = RENOTIFY_S << (B.failures - 1 < 4 ? B.failures - 1 : 4);
       if ((uint32_t)(now - B.lastTry) < wait) continue;
@@ -1759,7 +1792,10 @@ static void driveBatches(time_t now) {
     B.lastTry = now;
     String msgId = postAlert(alertText(b, now));
     if (msgId.length()) {
+      B.older[1] = B.older[0];
+      B.older[0] = B.msgId;
       B.msgId = msgId;
+      B.callPost = false;
       B.lastSent = now;
       B.sent++;
       // Skip to the current slot rather than catch up on missed ones: after a

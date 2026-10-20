@@ -370,7 +370,8 @@ WiFi(撥號本身仍走 4G)。air-watchdog 的程式碼已刪,沒 commit 過。
 1. 節點失聯 → Discord 告警(同以前),訊息多一行「N 分鐘內沒人確認會撥電話」
 2. 第 3 則通知(episode 開始 10 分鐘;b48 是 15 分鐘)仍無 ✅ → 同時 `DIAL`,響 25 秒不接就掛;
    w56 起每 3 分鐘再撥一輪、無上限,只有 ✅ 能停(接起來不算,dialer 1.0.4 起接通即掛、不唸 TTS)。
-   號碼在 `/alertControl/callNumbers`,見 docs/notes.md
+   號碼在 `/alertControl/callNumbers`,見 docs/notes.md。w57 起電話開始後 Discord 跟著每輪發,
+   最近 3 則的 ✅ 都算
 3. ✅ 同時靜音 Discord 與電話 1 小時;靜音結束仍失聯 → 新 episode,電話重新等 15 分
 4. 撥號以**時間**為準,不看 Discord 發成功幾次——Discord 掛掉也照撥
 
