@@ -59,10 +59,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w60-2026.10.20";
+static const char *FW_VERSION = "w61-2026.10.20";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 60;
+static const uint32_t FW_VERSION_CODE = 61;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -963,18 +963,18 @@ static const uint32_t AIR_DIAL_GAP_MS = 5000;
 static const int RING_S = 25;
 
 // The phone rings together with this Discord notification of an episode --
-// the third -- if none has been ticked: notifications go out at 0, 5 and 10
-// minutes after a node went stale, so the call lands ~15 minutes after the
-// supply actually failed (b48 waited one more period, ~20; the user asked for
-// it with the third). Keyed to time rather than to how many posts succeeded,
-// so a Discord outage cannot hold the phone back.
+// the second -- if none has been ticked: notifications go out at 0 and 5
+// minutes after a node went stale, so the call lands ~10 minutes after the
+// supply actually failed. With the third (+10) until w61, and the fourth
+// before b49. Keyed to time rather than to how many posts succeeded, so a
+// Discord outage cannot hold the phone back.
 //
 // The episode starts when the node went stale -- its last beat plus the stale
 // limit -- not when this board noticed. Since b53: before, a watchdog that was
 // itself down (or rebooting, which a sagging supply made it do every few
 // minutes) restarted the ten minutes from whenever it got back, and a supply
 // that failed while it was down rang 30 minutes late instead of at once.
-static const int NOTIFIES_BEFORE_CALL = 3;
+static const int NOTIFIES_BEFORE_CALL = 2;
 
 // When an episode's first call is due: the moment its NOTIFIES_BEFORE_CALL-th
 // notification is.
@@ -994,15 +994,26 @@ static const uint32_t CALL_REPEAT_S = 3 * 60;
 // minutes apart that way). Due this much early counts as due.
 static const uint32_t CALL_SLACK_S = 30;
 
-// The numbers, rung one after another in this order each round. They live in
-// /alertControl/callNumbers (a list), so they are changed from RTDB without a
-// release. The last list read is kept in NVS, so a reboot with RTDB out of
-// reach still rings the right phones; until a list has ever been read, the one
-// compiled in from secrets.h.
+// Who is rung, as a cycle of rounds: one round per CALL_REPEAT_S, its numbers
+// rung one after another, and after the last round the first again. So
+//   [["0927..","0910.."], ["0927..","0910.."], ["0932.."]]
+// rings 0927 0910, then 0927 0910, then 0932, then 0927 0910 again -- the
+// third phone is only woken once the first two have slept through twice. A
+// flat list ["a","b"] is a single round, which is how it was until w61.
+//
+// It lives in /alertControl/callNumbers, so it is changed from RTDB without a
+// release. The last one read is kept in NVS, so a reboot with RTDB out of
+// reach still rings the right phones; until one has ever been read, the list
+// compiled in from secrets.h, as a single round.
+//
+// Held as "a,b;a,b;c" -- rounds split by ';', numbers by ',' -- which is also
+// how NVS stores it (a list saved before w61 has no ';', so reads back as the
+// single round it was).
 static const char *CALL_NUMBERS_BUILTIN[] = CALL_NUMBERS;
-static const int MAX_CALL_NUMBERS = 6;
-static String callNumbers[MAX_CALL_NUMBERS];
-static int callNumberCount = 0;
+static const int MAX_CALL_NUMBERS = 6;  // per round
+static const int MAX_CALL_ROUNDS = 6;
+static String callRounds[MAX_CALL_ROUNDS];  // each "a,b"
+static int callRoundCount = 0;
 static String callNumbersFrom = "built-in";  // built-in | nvs | db
 static String callNumbersBad = "";           // last unusable list warned about
 static Preferences callPrefs;
@@ -1019,32 +1030,52 @@ static bool callNumberValid(const String &n) {
   return true;
 }
 
-static String callNumbersJoined() {
+static String callRoundsJoined() {
   String s;
-  for (int i = 0; i < callNumberCount; i++)
-    s += (i ? "," : "") + callNumbers[i];
+  for (int i = 0; i < callRoundCount; i++) s += (i ? ";" : "") + callRounds[i];
   return s;
 }
 
-// Takes a comma-separated list; returns how many usable numbers it held. With
-// none, the current list is left alone.
-static int callNumbersSet(const String &list, const char *from) {
-  String found[MAX_CALL_NUMBERS];
-  int n = 0, pos = 0;
-  while (pos <= (int)list.length() && n < MAX_CALL_NUMBERS) {
-    int comma = list.indexOf(',', pos);
-    if (comma < 0) comma = list.length();
-    String num = list.substring(pos, comma);
-    num.trim();
-    if (callNumberValid(num)) found[n++] = num;
-    else if (num.length()) logLine("call numbers: ignoring \"%s\"", num.c_str());
-    pos = comma + 1;
+// For Discord: "0927、0910 → 0927、0910 → 0932，循環".
+static String callRoundsShown() {
+  String s = callRoundsJoined();
+  s.replace(",", "、");
+  s.replace(";", " → ");
+  if (callRoundCount > 1) s += "，循環";
+  return s;
+}
+
+// Takes "a,b;a,b;c"; returns how many usable rounds it held. With none, the
+// current rounds are left alone. Unusable numbers are dropped, and a round
+// left with none is dropped with them.
+static int callRoundsSet(const String &spec, const char *from) {
+  String found[MAX_CALL_ROUNDS];
+  int rounds = 0, rpos = 0;
+  while (rpos <= (int)spec.length() && rounds < MAX_CALL_ROUNDS) {
+    int semi = spec.indexOf(';', rpos);
+    if (semi < 0) semi = spec.length();
+    String list = spec.substring(rpos, semi), round;
+    int n = 0, pos = 0;
+    while (pos <= (int)list.length() && n < MAX_CALL_NUMBERS) {
+      int comma = list.indexOf(',', pos);
+      if (comma < 0) comma = list.length();
+      String num = list.substring(pos, comma);
+      num.trim();
+      if (callNumberValid(num)) {
+        round += (n++ ? "," : "") + num;
+      } else if (num.length()) {
+        logLine("call numbers: ignoring \"%s\"", num.c_str());
+      }
+      pos = comma + 1;
+    }
+    if (n) found[rounds++] = round;
+    rpos = semi + 1;
   }
-  if (!n) return 0;
-  for (int i = 0; i < n; i++) callNumbers[i] = found[i];
-  callNumberCount = n;
+  if (!rounds) return 0;
+  for (int i = 0; i < rounds; i++) callRounds[i] = found[i];
+  callRoundCount = rounds;
   callNumbersFrom = from;
-  return n;
+  return rounds;
 }
 
 // Once, at boot.
@@ -1052,53 +1083,82 @@ static void callNumbersLoad() {
   callPrefs.begin("calls", true);
   String saved = callPrefs.getString("list", "");
   callPrefs.end();
-  if (callNumbersSet(saved, "nvs")) return;
+  if (callRoundsSet(saved, "nvs")) return;
   String builtin;
   for (const char *n : CALL_NUMBERS_BUILTIN)
     builtin += String(builtin.length() ? "," : "") + n;
-  callNumbersSet(builtin, "built-in");
+  callRoundsSet(builtin, "built-in");
+}
+
+// The scalar values of a list, comma-joined. A list edited by hand in the
+// Firebase console comes back as an object once an entry in the middle is
+// deleted -- {"0":..,"2":..}, keys in order -- so both shapes are taken.
+static String jsonListJoined(JsonVariantConst v) {
+  String s;
+  if (v.is<JsonArrayConst>()) {
+    for (JsonVariantConst e : v.as<JsonArrayConst>())
+      s += (s.length() ? "," : "") + e.as<String>();
+  } else if (v.is<JsonObjectConst>()) {
+    for (JsonPairConst e : v.as<JsonObjectConst>())
+      s += (s.length() ? "," : "") + e.value().as<String>();
+  } else {
+    s = v.as<String>();
+  }
+  return s;
+}
+
+static bool jsonIsList(JsonVariantConst v) {
+  return v.is<JsonArrayConst>() || v.is<JsonObjectConst>();
 }
 
 // Called with /alertControl/callNumbers on every good read of it. A missing
-// entry leaves the list as it is. One with nothing dialable in it is taken for
-// a mistake rather than a wish for silence -- switching alerts off is what the
-// rest of /alertControl is for -- so the old list stays, and Discord hears
-// about it once.
+// entry leaves the rounds as they are. One with nothing dialable in it is
+// taken for a mistake rather than a wish for silence -- switching alerts off
+// is what the rest of /alertControl is for -- so the old rounds stay, and
+// Discord hears about it once.
 static void callNumbersFromDb(JsonVariantConst v) {
   if (v.isNull()) return;
-  String list;
+  // Rounds when any entry is itself a list (a lone number then being a round
+  // of one); otherwise one round of them all.
+  bool nested = false;
   if (v.is<JsonArrayConst>()) {
-    for (JsonVariantConst e : v.as<JsonArrayConst>())
-      list += (list.length() ? "," : "") + e.as<String>();
+    for (JsonVariantConst e : v.as<JsonArrayConst>()) nested |= jsonIsList(e);
   } else if (v.is<JsonObjectConst>()) {
-    // A list edited by hand in the Firebase console comes back as an object
-    // once an entry in the middle is deleted: {"0":..,"2":..}, keys in order.
     for (JsonPairConst e : v.as<JsonObjectConst>())
-      list += (list.length() ? "," : "") + e.value().as<String>();
+      nested |= jsonIsList(e.value());
+  }
+  String spec;
+  if (!nested) {
+    spec = jsonListJoined(v);
+  } else if (v.is<JsonArrayConst>()) {
+    for (JsonVariantConst e : v.as<JsonArrayConst>())
+      spec += (spec.length() ? ";" : "") + jsonListJoined(e);
   } else {
-    list = v.as<String>();
+    for (JsonPairConst e : v.as<JsonObjectConst>())
+      spec += (spec.length() ? ";" : "") + jsonListJoined(e.value());
   }
 
-  String before = callNumbersJoined();
+  String before = callRoundsJoined();
+  String beforeShown = callRoundsShown();
   String beforeFrom = callNumbersFrom;
-  if (!callNumbersSet(list, "db")) {
-    if (list != callNumbersBad) {
-      callNumbersBad = list;
+  if (!callRoundsSet(spec, "db")) {
+    if (spec != callNumbersBad) {
+      callNumbersBad = spec;
       logLine("call numbers: nothing dialable in db, keeping %s",
               before.c_str());
-      discordSay("📞 撥號名單裡沒有可撥的號碼，沿用：" + before);
+      discordSay("📞 撥號名單裡沒有可撥的號碼，沿用：" + beforeShown);
     }
     return;
   }
   callNumbersBad = "";
-  String now = callNumbersJoined();
+  String now = callRoundsJoined();
   if (now == before && beforeFrom != "built-in") return;
   callPrefs.begin("calls", false);
   callPrefs.putString("list", now);
   callPrefs.end();
   if (now == before) return;  // the built-in list confirmed: nothing to say
   logLine("call numbers: %s (was %s)", now.c_str(), before.c_str());
-  discordSay("📞 撥號名單：" + now);
+  discordSay("📞 撥號名單：" + callRoundsShown());
 }
 
 struct AirStatus {
@@ -1129,15 +1189,43 @@ static uint32_t pingSentMs = 0;
 static uint32_t nextPingMs = 15000;  // first PING shortly after boot
 static String airLine;
 
-// Queues one call per number, in order.
-static void airDial(bool alarm) {
-  for (int i = 0; i < callNumberCount; i++) {
+// Queues one call per number of a comma-separated list, in order.
+static void airQueue(const String &list, bool alarm) {
+  int pos = 0;
+  while (pos < (int)list.length()) {
+    int comma = list.indexOf(',', pos);
+    if (comma < 0) comma = list.length();
+    String num = list.substring(pos, comma);
+    pos = comma + 1;
     if (dialQueueLen >= MAX_CALL_NUMBERS) {
-      logLine("air: dial queue full, dropping %s", callNumbers[i].c_str());
+      logLine("air: dial queue full, dropping %s", num.c_str());
       continue;
     }
-    dialQueue[dialQueueLen++] = {callNumbers[i], alarm};
+    dialQueue[dialQueueLen++] = {num, alarm};
   }
+}
+
+// The round-th round of the cycle (0 = the first), for an alert.
+static void airDialRound(int round) {
+  airQueue(callRounds[round % callRoundCount], true);
+}
+
+// Every number in the rounds, once each: what /testcall rings.
+static String callNumbersDistinct() {
+  String all;
+  for (int r = 0; r < callRoundCount; r++) {
+    int pos = 0;
+    const String &list = callRounds[r];
+    while (pos < (int)list.length()) {
+      int comma = list.indexOf(',', pos);
+      if (comma < 0) comma = list.length();
+      String num = list.substring(pos, comma);
+      pos = comma + 1;
+      if (("," + all + ",").indexOf("," + num + ",") < 0)
+        all += (all.length() ? "," : "") + num;
+    }
+  }
+  return all;
 }
 
 static void airSend(const String &line) {
@@ -1779,16 +1867,21 @@ static void driveBatches(time_t now) {
              (!lastPhoneAt ||
               (uint32_t)(now - lastPhoneAt) + CALL_SLACK_S >= CALL_REPEAT_S)) {
     lastPhoneAt = now;
+    // Where in the cycle of rounds: the longest-running alert's count. Taken
+    // from the batches, which survive a reboot, rather than kept apart.
+    int round = 0;
     for (int b = 0; b < MAX_BATCHES; b++) {
       Batch &B = batches[b];
       if (B.inUse && !B.ackedAt && now >= callDueAt(B.episodeAt)) {
+        if (B.calls > round) round = B.calls;
         B.calls++;
         B.callPost = true;
         B.dirty = true;
       }
     }
-    logLine("unacknowledged alerts, phoning %d number(s)", callNumberCount);
-    airDial(true);
+    logLine("unacknowledged alerts, phoning round %d: %s", round + 1,
+            callRounds[round % callRoundCount].c_str());
+    airDialRound(round);
   }
 
   // Discord, paced per batch and backed off after failures (doubling, capped
@@ -2568,7 +2661,7 @@ static void handleRoot() {
   b += "dialer calls: " + String(air.calls) + ", last: " + air.lastOutcome +
        ", restarts: " + String(air.restarts) +
        (dialInFlight ? "  [CALLING " + dialNumber + "]" : String("")) + "\n";
-  b += "call numbers (" + callNumbersFrom + "): " + callNumbersJoined() + "\n";
+  b += "call rounds (" + callNumbersFrom + "): " + callRoundsJoined() + "\n";
   // Which OTA slot is live, and how much room the next update has. A failed
   // "Could Not Activate" points here first.
   const esp_partition_t *run = esp_ota_get_running_partition();
@@ -2663,19 +2756,28 @@ static void handleFwCheck() {
                   otaPullStatus() + "\n");
 }
 
-// Rings every configured number now, for checking the phone path without
-// taking a node down. Guarded like /wifi: each call can cost money if
-// answered, so it is not something a passer-by on the LAN should trigger.
-//   GET /testcall?pass=<OTA_PASSWORD>
+// Rings every configured number now, or just num=, for checking the phone
+// path without taking a node down. Guarded like /wifi: each call can cost
+// money if answered, so it is not something a passer-by on the LAN should
+// trigger.
+//   GET /testcall?pass=<OTA_PASSWORD>[&num=<number>]
 static void handleTestCall() {
   if (!configAuthorised()) {
     server.send(403, "text/plain; charset=utf-8", "bad pass");
     return;
   }
-  airDial(false);
+  // num= rings that one number; without it, every number in the rounds once.
+  String list = server.arg("num");
+  list.trim();
+  if (list.length() && !callNumberValid(list)) {
+    server.send(400, "text/plain; charset=utf-8", "bad num\n");
+    return;
+  }
+  if (!list.length()) list = callNumbersDistinct();
+  airQueue(list, false);
   server.send(200, "text/plain; charset=utf-8",
-              "queued " + String(callNumberCount) +
-                  " call(s); the result shows on / as \"dialer calls\"\n");
+              "queued " + list +
+                  "; the result shows on / as \"dialer calls\"\n");
 }
 
 static void handleTestAlert() {

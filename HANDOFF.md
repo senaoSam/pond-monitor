@@ -368,7 +368,7 @@ WiFi(撥號本身仍走 4G)。air-watchdog 的程式碼已刪,沒 commit 過。
 ### 告警時序
 
 1. 節點失聯 → Discord 告警(同以前),訊息多一行「N 分鐘內沒人確認會撥電話」
-2. 第 3 則通知(episode 開始 10 分鐘;b48 是 15 分鐘)仍無 ✅ → 同時 `DIAL`,響 25 秒不接就掛;
+2. 第 2 則通知(episode 開始 5 分鐘,w61 起;之前第 3 則/10 分鐘,b48 是 15 分鐘)仍無 ✅ → 同時 `DIAL`,響 25 秒不接就掛;
    w56 起每 3 分鐘再撥一輪、無上限,只有 ✅ 能停(接起來不算,dialer 1.0.4 起接通即掛、不唸 TTS)。
    號碼在 `/alertControl/callNumbers`,見 docs/notes.md。w57 起電話開始後 Discord 跟著每輪發,
    最近 3 則的 ✅ 都算
@@ -377,7 +377,7 @@ WiFi(撥號本身仍走 4G)。air-watchdog 的程式碼已刪,沒 commit 過。
 
 B 每 30 秒 `PING`,收到 `PONG` 回 `LINK`;連續 10 次(~5 分)沒回應 → PWR_EN
 拉低 3 秒斷電重啟,Discord 發一則(不 @)。狀態寫在 `/devices/watchdog/latest/air`
-(`ok` = 有回 PING 且 IMS 已註冊)。`/testcall?pass=<OTA密碼>` 立刻撥一通。
+(`ok` = 有回 PING 且 IMS 已註冊)。`/testcall?pass=<OTA密碼>[&num=<號碼>]` 立刻撥(不帶 num = 名單每支各一通)。
 
 ### 硬體(銀爾達 Air724UG DTU 底板 V1.03)
 
