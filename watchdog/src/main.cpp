@@ -59,10 +59,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w59-2026.10.20";
+static const char *FW_VERSION = "w60-2026.10.20";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 59;
+static const uint32_t FW_VERSION_CODE = 60;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -1436,6 +1436,20 @@ static bool alertsEnabledFor(const String &id, time_t now) {
   return anyOn || !anyOff;
 }
 
+// How a node is named in Discord: its pond first, as set on the website
+// ("文安1池(文安) A01"), since at 3am which pond matters before which board.
+// The groups are the ponds; a board in none is named by its id alone. Ready
+// for a JSON body, like the rest of the message.
+static String nodeLabel(const String &id) {
+  for (JsonPairConst g : alertCtl["groups"].as<JsonObjectConst>()) {
+    JsonVariantConst e = g.value();
+    if (!alertGroupHas(e["members"], id)) continue;
+    String name = e["name"] | "";
+    if (name.length()) return jsonEscape(name) + " " + jsonEscape(id);
+  }
+  return jsonEscape(id);
+}
+
 // ---- alert batches ----------------------------------------------------
 //
 // Each heartbeat board watches a different supply, so several going down in
@@ -1618,8 +1632,8 @@ static bool alertsRestore() {
 
 // The message for one batch. One node reads like the old per-node alert; more
 // get a line each. Renders e.g.:
-//   @owner ⚠️ **3 處失聯**：A01、A05、A06（第 2 次提醒）
-//   • A01（打氣機）最後回報 14:32，已中斷 9 分鐘
+//   @owner ⚠️ **3 處失聯**：文安1池(文安) A01、A05、A06（第 2 次提醒）
+//   • 文安1池(文安) A01（打氣機）最後回報 14:32，已中斷 9 分鐘
 //   ...
 //   ⚠️ 魚塭 A 全部 10 片都失聯 → 比較可能是網路問題
 //   10 分鐘內沒人確認會撥電話
@@ -1634,14 +1648,14 @@ static String alertText(int b, time_t now) {
     NodeState &ns = nodeStates[i];
     if (!ns.inUse || !ns.alertActive || ns.batch != b) continue;
     if (n++) list += "、";
-    list += jsonEscape(ns.id);
+    list += nodeLabel(ns.id);
     only = &ns;
     int s = siteIndex(ns.id);
     if (s >= 0) sitesHit[s] = true;
   }
 
   String c = "<@" + String(DISCORD_USER_ID) + "> ⚠️ **";
-  c += (n == 1) ? jsonEscape(only->id) + " 失聯**"
+  c += (n == 1) ? nodeLabel(only->id) + " 失聯**"
                 : String(n) + " 處失聯**：" + list;
   if (B.sent > 0) c += "（第 " + String(B.sent + 1) + " 次提醒）";
   c += "\\n";
@@ -1655,7 +1669,7 @@ static String alertText(int b, time_t now) {
     for (int i = 0; i < MAX_NODES; i++) {
       NodeState &ns = nodeStates[i];
       if (!ns.inUse || !ns.alertActive || ns.batch != b) continue;
-      c += "• " + jsonEscape(ns.id);
+      c += "• " + nodeLabel(ns.id);
       if (ns.note.length()) c += "（" + jsonEscape(ns.note) + "）";
       c += " 最後回報 " + localHhMm(ns.lastSeen) + "，已中斷 " +
            humanDuration(ns.age) + "\\n";
@@ -2095,7 +2109,7 @@ static void runCheck() {
                             ? (uint32_t)((time_t)ts - ns.lastSeen) : 0;
         writeOutage(id, ns.lastSeen, false, (time_t)ts, "");
         if (!ns.muted) {
-          recovered += "✅ **" + jsonEscape(id) + " 恢復**";
+          recovered += "✅ **" + nodeLabel(id) + " 恢復**";
           if (ns.note.length()) recovered += "（" + jsonEscape(ns.note) + "）";
           if (down) recovered += "，中斷 " + humanDuration(down);
           recovered += "\\n";
