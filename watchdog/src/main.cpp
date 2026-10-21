@@ -59,10 +59,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w61-2026.10.20";
+static const char *FW_VERSION = "w62-2026.10.21";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 61;
+static const uint32_t FW_VERSION_CODE = 62;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -208,8 +208,8 @@ static void blinkColor(StatusColor c, int times, int onMs) {
 //   1. NVS target        what /wifi last stored; the normal case
 //   2. NVS target_prev   the target before that, so a mistyped SSID undoes
 //                        itself instead of stranding the board
-//   3. WIFI_NETWORKS     the known sites from secrets.h -- the Taipei bench, the
-//                        family house, the pond
+//   3. WIFI_NETWORKS     the known sites from secrets.h -- the family house, the
+//                        pond, the iQOO hotspot, the Taipei bench last
 //   4. NVS rescue        the hand-opened phone hotspot
 //
 // Ordered by what each one costs to use, cheapest first. The known sites need
