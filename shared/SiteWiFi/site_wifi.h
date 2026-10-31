@@ -12,6 +12,7 @@
 //   /wifi       sets the target network. Served as a form, so the person on
 //               site fills in their own network's name and password.
 //   /rescue     sets the rescue hotspot itself.
+//   /scan       what the board can see from where it stands, read-only.
 //   site WiFi   RTDB /sites/<letter>/wifi {ssid, pass}: one entry for every
 //               board at that pond. Fill it in before swapping a router and
 //               each board stores it on its next sync; when the old network
@@ -152,23 +153,114 @@ static bool onRescueNetwork = false;
 static bool onSiteWifi = false;         // came up on the RTDB site entry
 static String connectedSsid = "none";
 
+// ---- why an attempt failed -----------------------------------------------
+//
+// Every failed attempt runs the full timeout whatever the cause, so the time
+// alone cannot tell "not in range" from "wrong password" from "router full".
+// Two things can: a scan before the attempts says whether the network is
+// there at all and how strong, and the driver's disconnect reason says why it
+// refused.
+
+struct SeenNetwork {
+  String ssid;
+  int32_t rssi;
+  int32_t channel;
+};
+static const int SITE_WIFI_SEEN_MAX = 20;
+static SeenNetwork seenNetworks[SITE_WIFI_SEEN_MAX];
+static int seenCount = 0;
+static String bootScan;  // the last scan, strongest first, for the records
+
+// 0 until the driver reports a disconnect during the current attempt.
+static volatile uint8_t attemptReason = 0;
+
+static void siteWifiEventsBegin() {
+  static bool registered = false;
+  if (registered) return;
+  registered = true;
+  WiFi.onEvent(
+      [](WiFiEvent_t, WiFiEventInfo_t info) {
+        // 8 is our own WiFi.disconnect() after a timed-out attempt; it can
+        // land after the next attempt has started and would hide its reason.
+        uint8_t r = info.wifi_sta_disconnected.reason;
+        if (r != 8) attemptReason = r;
+      },
+      ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+}
+
+// Short and ASCII: these go inside the attempts line.
+static String siteWifiReasonName(uint8_t r) {
+  switch (r) {
+    case 0: return "no-answer";        // no refusal at all, e.g. no DHCP
+    case 201: return "not-found";      // NO_AP_FOUND
+    case 200: return "lost-signal";    // BEACON_TIMEOUT
+    case 2: case 15: case 202: case 204:
+      return "auth-" + String(r);      // wrong password / handshake
+    case 5: return "ap-full";          // ASSOC_TOOMANY
+    case 203: return "assoc-refused";  // ASSOC_FAIL
+    default: return "reason-" + String(r);
+  }
+}
+
+// Fills seenNetworks and bootScan. Takes two to three seconds.
+static void siteWifiScan() {
+  // Stops a pending attempt, which would otherwise make the scan fail.
+  if (WiFi.status() != WL_CONNECTED) WiFi.disconnect();
+  int n = WiFi.scanNetworks();
+  seenCount = 0;
+  for (int i = 0; i < n && seenCount < SITE_WIFI_SEEN_MAX; i++) {
+    if (!WiFi.SSID(i).length()) continue;  // hidden
+    seenNetworks[seenCount++] = {WiFi.SSID(i), WiFi.RSSI(i), WiFi.channel(i)};
+  }
+  WiFi.scanDelete();
+
+  // Strongest first, so the line can be cut short without losing what matters.
+  for (int i = 1; i < seenCount; i++)
+    for (int j = i; j > 0 && seenNetworks[j].rssi > seenNetworks[j - 1].rssi; j--) {
+      SeenNetwork t = seenNetworks[j];
+      seenNetworks[j] = seenNetworks[j - 1];
+      seenNetworks[j - 1] = t;
+    }
+
+  bootScan = n < 0 ? String("(scan failed)") : String("");
+  for (int i = 0; i < seenCount && i < 12; i++) {
+    if (bootScan.length()) bootScan += " ";
+    bootScan += seenNetworks[i].ssid + "(" + String(seenNetworks[i].rssi) +
+                ",ch" + String(seenNetworks[i].channel) + ")";
+  }
+  if (!bootScan.length()) bootScan = "(nothing in range)";
+}
+
+// The strongest RSSI the last scan saw for this name, or 0 if it was not seen.
+static int32_t seenRssi(const String &ssid) {
+  for (int i = 0; i < seenCount; i++)
+    if (seenNetworks[i].ssid == ssid) return seenNetworks[i].rssi;
+  return 0;
+}
+
 static bool tryNetwork(const String &ssid, const String &pass) {
   if (!ssid.length()) return false;
   uint32_t started = millis();
+  attemptReason = 0;
   WiFi.begin(ssid.c_str(), pass.c_str());
   uint32_t deadline = started + SITE_WIFI_ATTEMPT_MS;
   while (WiFi.status() != WL_CONNECTED && millis() < deadline)
     siteWifiWaitTick();
 
-  // Which networks were tried, in what order, and how long each took is what
-  // separates "wrong password" (fails fast) from "router not answering" (runs
-  // the full timeout) from "weak signal" (connects slowly at a poor RSSI).
+  // Which networks were tried, in what order, how long each took, and on a
+  // failure why and whether the scan saw it at all.
   uint32_t took = millis() - started;
   bool ok = WiFi.status() == WL_CONNECTED;
   if (bootAttempts.length()) bootAttempts += " ";
   bootAttempts += ssid + (ok ? ":ok(" : ":fail(") + String(took / 1000.0, 1) +
                   "s";
-  if (ok) bootAttempts += "," + String(WiFi.RSSI()) + "dBm";
+  if (ok) {
+    bootAttempts += "," + String(WiFi.RSSI()) + "dBm";
+  } else {
+    int32_t seen = seenRssi(ssid);
+    bootAttempts += "," + siteWifiReasonName(attemptReason);
+    bootAttempts += seen ? "," + String(seen) + "dBm" : String(",unseen");
+  }
   bootAttempts += ")";
   bootWifiMs += took;
 
@@ -179,6 +271,8 @@ static bool tryNetwork(const String &ssid, const String &pass) {
 
 static bool connectWiFi() {
   onRescueNetwork = onKnownSite = onSiteWifi = false;
+  siteWifiEventsBegin();
+  siteWifiScan();
 
   Credentials target = storedTarget();
   bool pending = targetPending();
@@ -437,10 +531,30 @@ static void handleRescueConfig() {
   server.send(200, "text/html; charset=utf-8", savedPage(ssid));
 }
 
+// A fresh scan on demand, for standing next to a board and asking what it can
+// see from there. Leaves the boot record alone.
+static void handleScan() {
+  WebServer &server = *siteWifiServer;
+  int n = WiFi.scanNetworks();
+  String b = "connected: " + connectedSsid + " (" + String(WiFi.RSSI()) + " dBm)\n";
+  b += n < 0 ? String("scan failed\n") : String(n) + " networks:\n";
+  for (int i = 0; i < n; i++) {
+    String name = WiFi.SSID(i).length() ? WiFi.SSID(i) : String("(hidden)");
+    bool known = false;
+    for (const WiFiNetwork &k : SITE_WIFI_KNOWN)
+      if (name == k.ssid) known = true;
+    b += String(WiFi.RSSI(i)) + " dBm  ch" + String(WiFi.channel(i)) + "  " +
+         name + (known ? "  [in list]" : "") + "\n";
+  }
+  WiFi.scanDelete();
+  server.send(200, "text/plain; charset=utf-8", b);
+}
+
 static void siteWifiAttach(WebServer &server) {
   siteWifiServer = &server;
   server.on("/wifi", handleWifiConfig);
   server.on("/rescue", handleRescueConfig);
+  server.on("/scan", handleScan);
 }
 
 // Status-page lines, so every sketch reports WiFi the same way.
@@ -466,5 +580,6 @@ static String siteWifiStatus() {
   b += "wifi at boot: " + (bootAttempts.length() ? bootAttempts : String("(none)"));
   if (bootPasses) b += "  [" + String(bootPasses) + " failed passes]";
   b += "\n";
+  b += "seen at boot: " + (bootScan.length() ? bootScan : String("(none)")) + "\n";
   return b;
 }
