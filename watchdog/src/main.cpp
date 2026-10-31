@@ -59,10 +59,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w62-2026.10.21";
+static const char *FW_VERSION = "w63-2026.10.31";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 62;
+static const uint32_t FW_VERSION_CODE = 63;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
