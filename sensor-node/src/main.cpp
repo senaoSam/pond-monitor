@@ -57,10 +57,10 @@ static const uint16_t REG_HUMID  = 0x0001;  // value is %RH x10
 static const char *DEVICE_ID = "pond-site";
 static const char *DEVICE_NAME = "fish-pond-site";
 static const char *DEVICE_SCOPE = "site";
-static const char *FW_VERSION = "t18-2026.10.31";
+static const char *FW_VERSION = "t19-2026.10.31";
 // Monotonic; RTDB /firmware/pond-site/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 18;
+static const uint32_t FW_VERSION_CODE = 19;
 
 // The probe's second register tracks temperature inversely and in lockstep
 // (~3% per degree), so it is derived rather than an independent humidity

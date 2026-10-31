@@ -43,10 +43,10 @@ static void siteWifiWaitTick();
 
 // ---- configuration ----------------------------------------------------
 static const char *FW_GROUP = "heartbeat";
-static const char *FW_VERSION = "h7-2026.10.31";
+static const char *FW_VERSION = "h8-2026.10.31";
 // Monotonic; /firmware/<group>/version is compared against this. Bump on
 // every release.
-static const uint32_t FW_VERSION_CODE = 7;
+static const uint32_t FW_VERSION_CODE = 8;
 
 // The onboard RGB. GPIO48 on the DevKitC-1 v1.0 layout these boards follow;
 // v1.1 boards moved it to GPIO38, so a dark LED on a new batch means look here
