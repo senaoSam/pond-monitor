@@ -57,10 +57,10 @@ static const uint16_t REG_HUMID  = 0x0001;  // value is %RH x10
 static const char *DEVICE_ID = "pond-site";
 static const char *DEVICE_NAME = "fish-pond-site";
 static const char *DEVICE_SCOPE = "site";
-static const char *FW_VERSION = "t19-2026.10.31";
+static const char *FW_VERSION = "t20-2026.11.11";
 // Monotonic; RTDB /firmware/pond-site/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 19;
+static const uint32_t FW_VERSION_CODE = 20;
 
 // The probe's second register tracks temperature inversely and in lockstep
 // (~3% per degree), so it is derived rather than an independent humidity
@@ -102,6 +102,14 @@ static const uint32_t WDT_TIMEOUT_S = 120;
 // and switch a hotspot on, and short enough that a firmware which genuinely
 // cannot connect still reaches the reboot that lets pull_ota roll it back.
 static const uint32_t WIFI_BOOT_ATTEMPTS = 4;
+
+// How long the running board stays off WiFi before it reboots into the boot
+// path above. The core's auto-reconnect only retries the network it was on,
+// and in 2.0.17 gives up for good on some refusals (AUTH_FAIL, 202), so
+// without this a board whose router went away could sit disconnected until
+// someone pulls the plug. The boot path walks the whole list, and keeps
+// rebooting and walking it until a network answers.
+static const uint32_t WIFI_LOST_REBOOT_MS = 60UL * 60 * 1000;
 
 static WebServer server(80);
 
@@ -1230,6 +1238,26 @@ void setup() {
   logLine("task watchdog armed at %lus", (unsigned long)WDT_TIMEOUT_S);
 }
 
+static void rebootIfWifiLost() {
+  static bool lost = false;
+  static uint32_t lostSince = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    lost = false;
+    return;
+  }
+  if (!lost) {
+    lost = true;
+    lostSince = millis();
+    return;
+  }
+  if (millis() - lostSince < WIFI_LOST_REBOOT_MS) return;
+  logLine("no wifi for %lu min, rebooting",
+          (unsigned long)(WIFI_LOST_REBOOT_MS / 60000));
+  setLed(PURPLE);
+  delay(500);
+  ESP.restart();
+}
+
 void loop() {
   static uint32_t nextUpload = 0;
   static uint32_t lastHistoryBucket = 0;
@@ -1249,6 +1277,7 @@ void loop() {
   }
 
   server.handleClient();
+  rebootIfWifiLost();
 
   if ((int32_t)(millis() - nextUpload) < 0) {
     // Pulse once every 2s while idle. Without this the LED is only lit for

@@ -59,10 +59,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w63-2026.10.31";
+static const char *FW_VERSION = "w64-2026.11.11";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 63;
+static const uint32_t FW_VERSION_CODE = 64;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -116,6 +116,14 @@ static const uint32_t DEFAULT_INTERVAL_S = 60;
 // on, and short enough that a firmware that genuinely cannot connect still
 // reaches the reboot that lets pull_ota roll it back.
 static const uint32_t WIFI_BOOT_ATTEMPTS = 4;
+
+// How long the running board stays off WiFi before it reboots into the boot
+// path above. The core's auto-reconnect only retries the network it was on,
+// and in 2.0.17 gives up for good on some refusals (AUTH_FAIL, 202), so
+// without this a board whose router went away could sit disconnected until
+// someone pulls the plug. The boot path walks the whole list, and keeps
+// rebooting and walking it until a network answers.
+static const uint32_t WIFI_LOST_REBOOT_MS = 60UL * 60 * 1000;
 
 // ---- state ------------------------------------------------------------
 static WebServer server(80);
@@ -3041,6 +3049,29 @@ void setup() {
   logLine("task watchdog armed at %lus", (unsigned long)WDT_TIMEOUT_S);
 }
 
+static void rebootIfWifiLost() {
+  static bool lost = false;
+  static uint32_t lostSince = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    lost = false;
+    return;
+  }
+  if (!lost) {
+    lost = true;
+    lostSince = millis();
+    return;
+  }
+  if (millis() - lostSince < WIFI_LOST_REBOOT_MS) return;
+  // Calls go out over the Air module's cellular link, not WiFi; a reboot
+  // would drop the ones still queued.
+  if (dialInFlight || dialQueueLen) return;
+  logLine("no wifi for %lu min, rebooting",
+          (unsigned long)(WIFI_LOST_REBOOT_MS / 60000));
+  setLed(PURPLE);
+  delay(500);
+  ESP.restart();
+}
+
 void loop() {
   static uint32_t nextCheck = 0;
 
@@ -3060,6 +3091,7 @@ void loop() {
 
   server.handleClient();
   airService();
+  rebootIfWifiLost();
 
   if ((int32_t)(millis() - nextCheck) < 0) {
     // Pulse while idle so health is readable at a glance: red means a node is
