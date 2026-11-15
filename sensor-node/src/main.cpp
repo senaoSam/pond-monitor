@@ -58,10 +58,10 @@ static const uint16_t REG_HUMID  = 0x0001;  // value is %RH x10
 static const char *DEVICE_ID = "pond-site";
 static const char *DEVICE_NAME = "fish-pond-site";
 static const char *DEVICE_SCOPE = "site";
-static const char *FW_VERSION = "t21-2026.11.15";
+static const char *FW_VERSION = "t22-2026.11.15";
 // Monotonic; RTDB /firmware/pond-site/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 21;
+static const uint32_t FW_VERSION_CODE = 22;
 
 // The probe's second register tracks temperature inversely and in lockstep
 // (~3% per degree), so it is derived rather than an independent humidity
@@ -571,6 +571,7 @@ static bool publish(float tempC, float humidPct, time_t ts, bool withHistory) {
   // be scanned from anywhere else.
   body += ",\"ssid\":\"" + jsonEscape(String(connectedSsid)) + "\"";
   body += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  body += ",\"rssi\":" + String(WiFi.RSSI());
   body += "}";
   if (withHistory) {
     body += ",\"history/" + String(DEVICE_ID) + "/" + month + "/" +

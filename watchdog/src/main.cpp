@@ -60,10 +60,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w65-2026.11.15";
+static const char *FW_VERSION = "w66-2026.11.15";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 65;
+static const uint32_t FW_VERSION_CODE = 66;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -2277,6 +2277,7 @@ static bool publishSelf() {
   // network that cannot be scanned from here.
   body += ",\"ssid\":\"" + jsonEscape(String(connectedSsid)) + "\"";
   body += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  body += ",\"rssi\":" + String(WiFi.RSSI());
   // The phone path. The dialer has no internet of its own, so this is the
   // only place its health is visible from outside: `ok` is the one-glance
   // answer (answering PINGs and registered for VoLTE), the rest says why not.
