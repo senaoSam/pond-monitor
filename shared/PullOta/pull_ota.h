@@ -51,6 +51,7 @@
 #include <esp_task_wdt.h>
 
 #include "flash_probe.h"
+#include "tls_client.h"
 
 // How many times a version that failed to confirm is retried before it is
 // treated as genuinely broken. Small, because each retry costs a download.
@@ -105,8 +106,7 @@ static void otaLogEvent(const char *rtdbHost, uint32_t fromVer,
   body += "}";
 
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10000);
+  tlsClientPrepare(client);
 
   HTTPClient http;
   String u = String("https://") + rtdbHost + "/fwlog/" + otaDeviceId + "/" +
@@ -205,8 +205,7 @@ static String otaPullGroup() { return otaGroup; }
 static bool otaFetchTarget(const char *rtdbHost, uint32_t *version,
                            String *url) {
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(12000);
+  tlsClientPrepare(client);
 
   HTTPClient http;
   String u = String("https://") + rtdbHost + "/firmware/" + otaGroup +
@@ -238,8 +237,7 @@ static bool otaDownloadAndApply(const String &url, uint32_t version) {
   otaAttempts++;
 
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(20000);
+  tlsClientPrepare(client);
 
   HTTPClient http;
   // GitHub release assets redirect to a CDN host, so redirects must be taken.

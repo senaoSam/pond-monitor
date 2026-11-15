@@ -36,6 +36,7 @@
 #include <time.h>
 
 #include "pull_ota.h"
+#include "tls_client.h"
 #include "reset_reason.h"
 #include "secrets.h"
 
@@ -57,10 +58,10 @@ static const uint16_t REG_HUMID  = 0x0001;  // value is %RH x10
 static const char *DEVICE_ID = "pond-site";
 static const char *DEVICE_NAME = "fish-pond-site";
 static const char *DEVICE_SCOPE = "site";
-static const char *FW_VERSION = "t20-2026.11.11";
+static const char *FW_VERSION = "t21-2026.11.15";
 // Monotonic; RTDB /firmware/pond-site/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 20;
+static const uint32_t FW_VERSION_CODE = 21;
 
 // The probe's second register tracks temperature inversely and in lockstep
 // (~3% per degree), so it is derived rather than an independent humidity
@@ -578,8 +579,7 @@ static bool publish(float tempC, float humidPct, time_t ts, bool withHistory) {
   body += "}";
 
   WiFiClientSecure client;
-  client.setInsecure();  // RTDB over TLS without pinning a CA on the device
-  client.setTimeout(10000);
+  tlsClientPrepare(client);
 
   HTTPClient http;
   String url = String("https://") + RTDB_HOST + "/.json";
@@ -616,8 +616,7 @@ static bool publishMeta() {
   body += "}";
 
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10000);
+  tlsClientPrepare(client);
 
   HTTPClient http;
   String url = String("https://") + RTDB_HOST + "/devices/" + DEVICE_ID +
@@ -752,8 +751,7 @@ static void incidentReport(const char *rtdbHost, const char *deviceId) {
   // Posted directly rather than through publish(): that call is shaped
   // around a reading, and this is not one.
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10000);
+  tlsClientPrepare(client);
   HTTPClient http;
   String url = String("https://") + rtdbHost + "/incidents/" +
                String(deviceId) + "/" + String((uint32_t)now) + ".json";

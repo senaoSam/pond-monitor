@@ -25,6 +25,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
+#include "tls_client.h"
+
 struct Identity {
   String mac;          // 12 uppercase hex digits, no separators
   String id;           // "A05", or "esp-<mac>" when unregistered
@@ -76,8 +78,7 @@ static Identity registryResolve(const char *rtdbHost) {
   me.mac = registryMac();
 
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10000);
+  tlsClientPrepare(client);
   HTTPClient http;
   String url = String("https://") + rtdbHost + "/registry/" + me.mac + ".json";
   int code = -1;

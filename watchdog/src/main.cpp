@@ -45,6 +45,7 @@
 #include <time.h>
 
 #include "pull_ota.h"
+#include "tls_client.h"
 #include "reset_reason.h"
 #include "secrets.h"
 
@@ -59,10 +60,10 @@ static const char *BENCH_SSID = "Wang3697";
 static const char *DEVICE_NAME = "home-watchdog";
 // "w" since w55; "b" (b54 and earlier) dated from when this was board B, and
 // B is now a pond. FW_VERSION_CODE carried on from 54 regardless.
-static const char *FW_VERSION = "w64-2026.11.11";
+static const char *FW_VERSION = "w65-2026.11.15";
 // Monotonic; RTDB /firmware/watchdog/version is compared against this to
 // decide whether a pull-based update is due. Bump on every release.
-static const uint32_t FW_VERSION_CODE = 64;
+static const uint32_t FW_VERSION_CODE = 65;
 
 // Two timed samples of the same 8-byte raw flash read, one from a global
 // constructor (before initArduino() runs psramInit()) and one from the top of
@@ -516,8 +517,7 @@ static String jsonEscape(const String &in) {
 static bool rtdbRequest(const char *method, const String &path,
                         const String &body, String *out) {
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(12000);
+  tlsClientPrepare(client);
 
   HTTPClient http;
   String url = String("https://") + RTDB_HOST + path;
@@ -720,8 +720,7 @@ static String botUserId = "";
 static bool discordRequest(const char *method, const String &path,
                            const String &body, String *out) {
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(12000);
+  tlsClientPrepare(client);
 
   HTTPClient http;
   if (!http.begin(client, "https://discord.com/api/v10" + path)) {

@@ -44,6 +44,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
+#include "tls_client.h"
+
 struct WiFiNetwork {
   const char *ssid;
   const char *pass;
@@ -348,8 +350,7 @@ static bool connectWiFi() {
 static void siteWifiSync(const char *rtdbHost, const String &site) {
   if (!site.length()) return;
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10000);
+  tlsClientPrepare(client);
   HTTPClient http;
   String url = String("https://") + rtdbHost + "/sites/" + site + "/wifi.json";
   if (!http.begin(client, url)) return;

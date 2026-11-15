@@ -39,14 +39,15 @@ static void siteWifiWaitTick();
 #include "site_wifi.h"
 #include "registry.h"
 #include "pull_ota.h"
+#include "tls_client.h"
 #include "reset_reason.h"
 
 // ---- configuration ----------------------------------------------------
 static const char *FW_GROUP = "heartbeat";
-static const char *FW_VERSION = "h10-2026.11.11";
+static const char *FW_VERSION = "h11-2026.11.15";
 // Monotonic; /firmware/<group>/version is compared against this. Bump on
 // every release.
-static const uint32_t FW_VERSION_CODE = 10;
+static const uint32_t FW_VERSION_CODE = 11;
 
 // The onboard RGB. GPIO48 on the DevKitC-1 v1.0 layout these boards follow;
 // v1.1 boards moved it to GPIO38, so a dark LED on a new batch means look here
@@ -160,8 +161,7 @@ static String jsonEscape(const String &in) {
 // ---- rtdb -------------------------------------------------------------
 static bool rtdb(const char *method, const String &path, const String &body) {
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10000);
+  tlsClientPrepare(client);
   HTTPClient http;
   if (!http.begin(client, String("https://") + RTDB_HOST + path)) {
     lastError = "http.begin failed";
